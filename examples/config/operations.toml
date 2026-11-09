@@ -1,0 +1,65 @@
+# Housekeeping: a Head of Station round on every Station each hour (see docs/stations.md).
+# The path must exist on every Station; authorize with `ai6 sleeper authorize housekeeping rounds`.
+# [operation.housekeeping]
+# path = "/var/lib/ai6/housekeeping"
+# clearance = "field"
+#
+# [operation.housekeeping.sleepers.rounds]
+# schedule = "0 * * * *"
+# title = "Station round"
+# prompt = "Look over this Station with station_report, act within its limits and file_report what you found."
+# role = "head-of-station"
+# each_station = true
+
+[operation.G]
+name = "AI6"
+path = "."
+workspace = { provider = "git", base = "HEAD", branch = "ai6/{id}-{slug}", isolate = true }
+roster = ["007", "008", "Tanner"]
+
+# Spending limits are off unless set (preset = "strict" sets conservative ones).
+[operation.G.budget]
+mission_cost_usd = 10.0
+operation_cost_usd_per_day = 50.0
+warn_at = 0.8
+
+# Exposure is always recorded; strict (the default) also restricts an exposed Session.
+[operation.G.exposure]
+preset = "strict"
+
+# An Agent is quarantined after this many incidents within the window (0 turns one off).
+[operation.G.quarantine]
+stalls = 3
+budget_stops = 2
+blown = true
+window_hours = 24
+
+# M asks for green ink to raise an Agent's clearance here once its record meets a step; a
+# person signs it. These are the defaults; missions = 0 turns a step off.
+[operation.G.promotion.field]
+missions = 10
+quiet_days = 30
+
+[operation.G.promotion."00"]
+missions = 25
+max_failure_rate = 0.1
+quiet_days = 60
+
+# The scorecard (Outer Office's Agents page, ai6ctl agents scorecard) covers the last 30 days and
+# calls a row under 5 judged attempts a small sample. These are the defaults.
+[operation.G.scorecard]
+window_days = 30
+small_sample = 5
+# M proposes from it, a person decides; every rule is off until set.
+# hold_above = 0.5      # propose holding an Agent or route whose failure rate is above this
+# reorder_gap = 0.3     # propose putting an Agent ahead of one sharing a role across this gap
+# auto_hold = false     # true: M holds by itself (audited; a person lifts it)
+# never_prefer = ["claude-fable-5-1"]
+
+# Open issues of a GitLab project that carry every intake label become Missions, and the outcome
+# comes back as a comment (docs/operations.md, "Sources"). The Station holding the Headquarters
+# lease reads the token from GITLAB_TOKEN; a self-managed instance adds api_url.
+# [operation.G.sources.gitlab]
+# project = "group/project"
+# labels = ["ai6:ready"]
+# status_labels = { working = "ai6:working", done = "ai6:done", failed = "ai6:blocked" }

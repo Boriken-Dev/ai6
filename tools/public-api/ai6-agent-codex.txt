@@ -1,0 +1,45 @@
+pub mod ai6_agent_codex
+pub struct ai6_agent_codex::CodexConfig
+pub ai6_agent_codex::CodexConfig::close_wait_ms: u64
+pub ai6_agent_codex::CodexConfig::context_file_bytes: u64
+pub ai6_agent_codex::CodexConfig::csi_bytes: u64
+pub ai6_agent_codex::CodexConfig::executable: alloc::string::String
+pub ai6_agent_codex::CodexConfig::exit_wait_ms: u64
+pub ai6_agent_codex::CodexConfig::json_line_bytes: u64
+pub ai6_agent_codex::CodexConfig::request_timeout_ms: u64
+pub ai6_agent_codex::CodexConfig::sandbox_error_chars: u64
+pub ai6_agent_codex::CodexConfig::sandbox_probe_lifetime_secs: u64
+pub ai6_agent_codex::CodexConfig::sandbox_probe_timeout_ms: u64
+pub ai6_agent_codex::CodexConfig::start_timeout_ms: u64
+pub ai6_agent_codex::CodexConfig::tail_line_bytes: u64
+pub ai6_agent_codex::CodexConfig::tail_lines: u64
+pub ai6_agent_codex::CodexConfig::tool_check_lifetime_secs: u64
+pub ai6_agent_codex::CodexConfig::tool_command_timeout_ms: u64
+pub ai6_agent_codex::CodexConfig::tree_scans: u64
+impl core::convert::TryFrom<ai6_agent_codex::CodexConfig> for ai6_agent_codex::CodexHandler
+pub type ai6_agent_codex::CodexHandler::Error = guatiao::library::kind::ProviderError
+pub fn ai6_agent_codex::CodexHandler::try_from(ai6_agent_codex::CodexConfig) -> core::result::Result<Self, Self::Error>
+impl core::default::Default for ai6_agent_codex::CodexConfig
+pub fn ai6_agent_codex::CodexConfig::default() -> Self
+pub struct ai6_agent_codex::CodexHandler
+impl ai6::directorates::section_00::agent::AgentHandler for ai6_agent_codex::CodexHandler
+pub fn ai6_agent_codex::CodexHandler::assistant_scripts(&self, alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> core::result::Result<core::option::Option<alloc::string::String>, guatiao::library::kind::ProviderError>
+pub fn ai6_agent_codex::CodexHandler::assistant_skills(&self) -> core::result::Result<core::option::Option<alloc::string::String>, guatiao::library::kind::ProviderError>
+pub fn ai6_agent_codex::CodexHandler::models(&self, alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> core::result::Result<ai6::directorates::section_00::agent::ModelListing, guatiao::library::kind::ProviderError>
+pub fn ai6_agent_codex::CodexHandler::program(&self) -> core::result::Result<core::option::Option<alloc::string::String>, guatiao::library::kind::ProviderError>
+pub fn ai6_agent_codex::CodexHandler::read_only_refusal(&self) -> core::result::Result<core::option::Option<alloc::string::String>, guatiao::library::kind::ProviderError>
+pub fn ai6_agent_codex::CodexHandler::resume(&self, ai6::directorates::section_00::agent::AgentResume, guatiao::library::kind::object::Object<dyn ai6::directorates::q::terminal::AgentTerminal>) -> core::result::Result<guatiao::library::kind::object::Object<dyn coqui_acp_provider::kind::AgentSession>, guatiao::library::kind::ProviderError>
+pub fn ai6_agent_codex::CodexHandler::session_record(&self, ai6::directorates::section_00::agent::SessionRecordQuery) -> core::result::Result<core::option::Option<ai6::directorates::section_00::agent::SessionRecordFile>, guatiao::library::kind::ProviderError>
+pub fn ai6_agent_codex::CodexHandler::start(&self, ai6::directorates::section_00::agent::AgentStart, guatiao::library::kind::object::Object<dyn ai6::directorates::q::terminal::AgentTerminal>) -> core::result::Result<guatiao::library::kind::object::Object<dyn coqui_acp_provider::kind::AgentSession>, guatiao::library::kind::ProviderError>
+pub fn ai6_agent_codex::CodexHandler::stdio(&self) -> core::result::Result<ai6::directorates::q::terminal::HarnessStdio, guatiao::library::kind::ProviderError>
+impl core::convert::TryFrom<ai6_agent_codex::CodexConfig> for ai6_agent_codex::CodexHandler
+pub type ai6_agent_codex::CodexHandler::Error = guatiao::library::kind::ProviderError
+pub fn ai6_agent_codex::CodexHandler::try_from(ai6_agent_codex::CodexConfig) -> core::result::Result<Self, Self::Error>
+impl guatiao::library::kind::parts::ProviderDecl for ai6_agent_codex::CodexHandler
+pub const ai6_agent_codex::CodexHandler::KINDS: &'static [&'static str]
+pub fn ai6_agent_codex::CodexHandler::provider(guatiao::library::raw::host::Host, guatiao::value::alloc::Alloc) -> core::result::Result<guatiao::library::kind::parts::ProviderParts, guatiao::value::error::ValueError>
+pub const ai6_agent_codex::KEPT_FEATURES: [&str; 5]
+pub const ai6_agent_codex::RECORD_FORMAT: &str
+pub const ai6_agent_codex::TOOL_CHECK_ENV: &str
+#[no_mangle] pub static ai6_agent_codex::guatiao_declares: [u8; 24]
+#[no_mangle] pub unsafe c fn ai6_agent_codex::guatiao_library_entry(*const guatiao::library::desc::HostInfo<'static>) -> *const guatiao::library::desc::LibraryInfo<'static>

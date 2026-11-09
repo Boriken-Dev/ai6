@@ -1,0 +1,2763 @@
+//! Moneypenny, the operator's assistant, as Universal Exports serves her.
+//!
+//! The model runs on a Station, through the same AgentHandler providers as every Agent: the
+//! roster's assistant Agent (`moneypenny` unless configured otherwise) with its handler,
+//! model, effort and model credentials. Universal Exports keeps the conversations, relays
+//! each message to a Station as an [`ai6::AssistantJob`] and what the harness says back to
+//! the app, and serves her tools on an MCP endpoint of its own. A tool runs as the person
+//! who is chatting, through the same routes and authorization as the app.
+//!
+//! When the roster's `[assistant]` gives people personal repositories, each message names the
+//! person's workspace (their repository, their groups' shared ones, their name for commits). A
+//! change to a shared repository is a proposal unless the group's repository is `write = true`.
+//! Her memory of the person needs none of it: rows in the Registry ([`memory`]), with the newest
+//! summaries in the context of each new harness.
+//!
+//! A conversation carries no exposure for what she reads: her gate is the person's confirmation, and
+//! exposure is for a Mission's Session. Tool results stay framed in `<ai6-data>`, which tells her
+//! what is data. Only a memory entry an exposed Session wrote leaves a mark on the conversation,
+//! which what she writes after it carries, so the mark is not washed out by passing through her.
+//!
+//! `show` and `navigate` only add an entry for the app: a view, or an app page offered as a
+//! card the person opens ([`routes`]). Neither reads nor changes anything, so neither is
+//! audited.
+//!
+//! Routes: `GET /v1/user/moneypenny` (the app's WebSocket), `POST /v1/moneypenny/mcp` (the
+//! harness's tools, with a token bound to the person and the conversation),
+//! `/v1/user/assistant/memory` (the person's memory, [`memory`]),
+//! `GET /v1/station/assistant/next`, `POST /v1/station/assistant/reports` and
+//! `GET /v1/station/assistant/cables` (the Stations).
+
+pub(crate) mod actions;
+pub(crate) mod cables;
+mod checks;
+mod guide;
+pub(crate) mod images;
+pub(crate) mod log;
+pub(crate) mod mcp;
+pub(crate) mod memory;
+pub(crate) mod page_tools;
+pub(crate) mod pages;
+pub(crate) mod routes;
+mod store;
+mod svg;
+pub(crate) mod tools;
+pub(crate) mod views;
+
+pub use pages::PagesConfig;
+pub use views::ViewLimits;
+
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use ai6::{
+    AssistantChange, AssistantCommit, AssistantEvent, AssistantGatewayLimits, AssistantJob,
+    AssistantLimits, AssistantReach, AssistantReport, AssistantSettings, AssistantWorkspace,
+    EVENT_ACCEPTED, EVENT_CABLE_PROPOSAL, EVENT_CABLE_SENT, EVENT_CLOSED, EVENT_COMPLETED,
+    EVENT_FAILED, EVENT_INTERRUPTED, EVENT_LIMIT, EVENT_NOTICE, EVENT_REJECTED, EVENT_TEXT,
+    EVENT_TOOL, Limit, Seconds,
+};
+use axum::Json;
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use tokio::sync::{Notify, broadcast};
+use uuid::Uuid;
+
+use crate::{
+    ApiError, Gateway, GatewayError, authorize_resource_action, bearer, resolve_user,
+    unix_timestamp,
+};
+use store::{Bounds, Conversation, Entry, Pending, Role, Store};
+
+/// Moneypenny's settings: which Agent she is and how much the gateway keeps.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssistantConfig {
+    agent_id: String,
+    limits: AssistantLimits,
+    gateway: AssistantGatewayLimits,
+    cable_body_bytes: Limit,
+    cable_default_ttl: Seconds,
+    route_text_bytes: usize,
+    views: views::ViewLimits,
+}
+
+impl Default for AssistantConfig {
+    fn default() -> Self {
+        let (cable_body_bytes, _, cable_default_ttl) = ai6::CableConfig::default().message_limits();
+        Self {
+            agent_id: "moneypenny".to_owned(),
+            limits: AssistantLimits::default(),
+            gateway: AssistantGatewayLimits::default(),
+            cable_body_bytes,
+            cable_default_ttl,
+            route_text_bytes: routes::DEFAULT_TEXT_BYTES,
+            views: views::ViewLimits::default(),
+        }
+    }
+}
+
+impl AssistantConfig {
+    /// Moneypenny is the roster Agent `agent_id`; every other setting at its default.
+    ///
+    /// # Errors
+    ///
+    /// [`GatewayError::InvalidConfiguration`] for an empty identifier, one longer than 256
+    /// bytes or one with control characters.
+    pub fn new(agent_id: impl Into<String>) -> Result<Self, GatewayError> {
+        let agent_id = agent_id.into();
+        if !ai6::directorates::section_00::assistant::valid_identity(&agent_id) {
+            return Err(GatewayError::InvalidConfiguration);
+        }
+        Ok(Self {
+            agent_id,
+            ..Self::default()
+        })
+    }
+
+    /// The roster Agent that is Moneypenny.
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+
+    /// The longest `text` filter an app route may carry, in bytes (default 128, at least 1):
+    /// in her links and cards, and in the page a message was sent from. A longer one refuses
+    /// the view, or drops the page line.
+    #[must_use]
+    pub fn with_route_text_bytes(mut self, bytes: usize) -> Self {
+        self.route_text_bytes = bytes.max(1);
+        self
+    }
+
+    pub(crate) fn route_limits(&self) -> routes::Limits {
+        routes::Limits {
+            text_bytes: self.route_text_bytes,
+        }
+    }
+
+    /// Holds jobs and reports to `limits` (`[assistant.limits]`), as the
+    /// Stations do.
+    ///
+    /// # Errors
+    ///
+    /// [`GatewayError::InvalidConfiguration`] for limits
+    /// [`AssistantLimits::validate`] refuses.
+    pub fn with_limits(mut self, limits: AssistantLimits) -> Result<Self, GatewayError> {
+        limits
+            .validate()
+            .map_err(|_| GatewayError::InvalidConfiguration)?;
+        self.limits = limits;
+        Ok(self)
+    }
+
+    /// Keeps her conversations within `limits` (`[assistant.gateway]`): how many are kept and
+    /// for how long, how much each holds, how many run at once, her tokens, proposals and tools.
+    ///
+    /// # Errors
+    ///
+    /// [`GatewayError::InvalidConfiguration`] for limits
+    /// [`AssistantGatewayLimits::validate`] refuses.
+    pub fn with_gateway_limits(
+        mut self,
+        limits: AssistantGatewayLimits,
+    ) -> Result<Self, GatewayError> {
+        limits
+            .validate()
+            .map_err(|_| GatewayError::InvalidConfiguration)?;
+        self.gateway = limits;
+        Ok(self)
+    }
+
+    /// Refuses a Cable she proposes with a body past `body_bytes`, and tells the person a
+    /// Cable that names no lifetime lasts `default_ttl`: the `cables` record's values
+    /// ([`ai6::CableConfig::message_limits`]), which the relay applies.
+    #[must_use]
+    pub fn with_cable_limits(mut self, body_bytes: Limit, default_ttl: Seconds) -> Self {
+        self.cable_body_bytes = body_bytes;
+        self.cable_default_ttl = default_ttl;
+        self
+    }
+
+    fn bounds(&self) -> Bounds {
+        Bounds {
+            entries: self.gateway.conversation_entries.or_max(),
+            bytes: self.gateway.conversation_bytes.or_max(),
+        }
+    }
+
+    /// The bounds of the views she shows ([`ViewLimits`], each at least 1); the app is sent
+    /// them with each conversation and checks views against the same values.
+    #[must_use]
+    pub fn with_view_limits(mut self, limits: ViewLimits) -> Self {
+        self.views = limits.at_least_one();
+        self
+    }
+}
+
+/// `[assistant.gateway]` of `gateway`'s assistant, the defaults without one.
+pub(crate) fn gateway_limits(gateway: &Gateway) -> AssistantGatewayLimits {
+    gateway
+        .assistant
+        .as_ref()
+        .map(|assistant| assistant.config.gateway.clone())
+        .unwrap_or_default()
+}
+
+/// The token a harness presents: whose conversation it is, and the Station whose harness was
+/// given it. It is withdrawn when the conversation moves to another Station.
+struct Grant {
+    conversation_id: String,
+    person_id: String,
+    station: String,
+    expires_at: f64,
+}
+
+#[derive(Default)]
+struct Desk {
+    store: Store,
+    /// Tokens by their SHA-256.
+    tokens: HashMap<String, Grant>,
+    /// Tool calls in the current minute, by conversation.
+    calls: HashMap<String, (Instant, u32)>,
+    /// Jobs that close or interrupt a harness, by the Station that runs it.
+    controls: Vec<(String, AssistantJob)>,
+    /// The control jobs a Station has not answered yet, by ID, with the Station given each.
+    controlling: HashMap<String, (String, Control)>,
+    /// Confirmed Cables waiting for their Station, by control job ID: the conversation, the
+    /// proposal and when they are given up, Unix seconds.
+    cable_deadlines: HashMap<String, (String, String, f64)>,
+}
+
+/// What a control job asks of a Station.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Control {
+    Close,
+    Interrupt,
+    /// A commit of a shared change, the proposal it carries out when the person confirmed one, and
+    /// what it is, for the note that tells her how it went.
+    Commit {
+        proposal: Option<String>,
+        what: String,
+    },
+    /// Send the Cable held for the proposal with this ID.
+    CableConfirm(String),
+    /// Drop the Cable held for the proposal with this ID.
+    CableDiscard(String),
+}
+
+/// A job that closes or interrupts the harness of `conversation`, or makes `commit`, sending
+/// no message; a Cable decision is the caller's to fill in.
+fn control_job(
+    conversation: &Conversation,
+    agent_id: &str,
+    control: &Control,
+    commit: Option<AssistantCommit>,
+) -> AssistantJob {
+    AssistantJob {
+        job_id: Uuid::new_v4().to_string(),
+        conversation_id: conversation.id.clone(),
+        agent_id: agent_id.to_owned(),
+        message: String::new(),
+        context: Vec::new(),
+        recap: None,
+        // Never accepted anywhere: a control starts no harness.
+        mcp_token: format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()),
+        token_expires_at: now() + 60.0,
+        session_id: conversation.session_id.clone(),
+        route: conversation.route.clone(),
+        close: *control == Control::Close,
+        interrupt: *control == Control::Interrupt,
+        person_id: Some(conversation.person_id.clone()),
+        workspace: None,
+        commit,
+        cables: Vec::new(),
+        cable_confirm: None,
+        cable_discard: None,
+        reach: AssistantReach::default(),
+        skills: Vec::new(),
+        // A control starts no harness, so it carries no reach, skills or groups.
+        groups: None,
+        images: Vec::new(),
+    }
+}
+
+impl Desk {
+    /// Asks the Station running `conversation_id`'s harness to close it, and withdraws the
+    /// conversation's tokens.
+    fn close_harness(&mut self, conversation_id: &str, agent_id: &str) {
+        let Some(conversation) = self.store.conversations.get_mut(conversation_id) else {
+            return;
+        };
+        conversation.live = false;
+        conversation.token = None;
+        let Some(station) = conversation.station.clone() else {
+            return;
+        };
+        let job = control_job(conversation, agent_id, &Control::Close, None);
+        self.tokens
+            .retain(|_, grant| grant.conversation_id != conversation_id);
+        self.controlling
+            .insert(job.job_id.clone(), (station.clone(), Control::Close));
+        self.controls.push((station, job));
+    }
+
+    /// Queues `commit` of `conversation_id` for `station`; its answer is handled as `control`.
+    /// A shared commit's job names `groups`, the person's directory groups, so the Station
+    /// checks the repository is theirs.
+    fn queue_commit(
+        &mut self,
+        conversation_id: &str,
+        agent_id: &str,
+        station: String,
+        (commit, groups): (AssistantCommit, Option<Vec<String>>),
+        control: Control,
+    ) {
+        let Some(conversation) = self.store.conversations.get(conversation_id) else {
+            return;
+        };
+        let mut job = control_job(conversation, agent_id, &control, Some(commit));
+        job.groups = groups;
+        self.controlling
+            .insert(job.job_id.clone(), (station.clone(), control));
+        self.controls.push((station, job));
+    }
+}
+
+/// The settings of Moneypenny's workspaces: the roster's `[assistant]`, the default without a
+/// roster.
+async fn assistant_settings(gateway: &Gateway) -> Result<AssistantSettings, String> {
+    let Some(source) = gateway.roster.clone() else {
+        return Ok(AssistantSettings::default());
+    };
+    tokio::task::spawn_blocking(move || source.load(""))
+        .await
+        .map_err(|error| error.to_string())?
+        .map(|snapshot| snapshot.roster.assistant().clone())
+        .map_err(|error| format!("the roster could not be read: {error}"))
+}
+
+/// Where `person`'s conversations keep their work, `None` when the deployment gives nobody a
+/// personal repository; an `Err` says why this person cannot have one.
+fn workspace_for(
+    settings: &AssistantSettings,
+    person: &ai6::Person,
+    author_chars: Limit,
+) -> Result<Option<AssistantWorkspace>, String> {
+    let Some(personal) = settings.personal_repo_for(&person.id)? else {
+        return Ok(None);
+    };
+    let (author_name, author_email) = author_of(person, author_chars);
+    Ok(Some(AssistantWorkspace {
+        personal,
+        shared: settings
+            .shared_for(&person.groups)
+            .map(|(name, repo)| (name.to_owned(), repo.repo().to_owned()))
+            .collect(),
+        author_name,
+        author_email,
+    }))
+}
+
+/// The name and email `person`'s commits are authored with: the directory's, without control
+/// characters, `<` or `>`, each at most `chars` characters; an email under the reserved
+/// `.invalid` domain when it has none.
+fn author_of(person: &ai6::Person, chars: Limit) -> (String, String) {
+    let printable = |value: &str| -> String {
+        value
+            .chars()
+            .map(|c| {
+                if c.is_control() || matches!(c, '<' | '>') {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect::<String>()
+            .trim()
+            .chars()
+            .take(chars.or_max())
+            .collect()
+    };
+    let name = printable(person.display_name.as_deref().unwrap_or(&person.name));
+    let email = person
+        .email
+        .as_deref()
+        .map(printable)
+        .filter(|email| !email.is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "{}@people.ai6.invalid",
+                ai6::directorates::m::assistant::person_digest(&person.id)
+            )
+        });
+    let name = if name.is_empty() {
+        printable(&person.id)
+    } else {
+        name
+    };
+    (name, email)
+}
+
+/// Settles proposal `id` of `conversation` as done or failed with `result`, and tells her
+/// with the next message.
+fn settle(conversation: &mut Conversation, id: &str, done: bool, result: &str) {
+    let Some(proposal) = conversation
+        .proposals
+        .iter_mut()
+        .find(|proposal| proposal.id == id)
+    else {
+        return;
+    };
+    proposal.status = if done { "done" } else { "failed" };
+    proposal.result = Some(result.to_owned());
+    let shown = proposal.clone();
+    conversation.show_proposal(&shown);
+    conversation.notes.push(format!(
+        "[App: the person confirmed {id} ({}). {}: {result}]",
+        shown.draft.summary,
+        if done { "Done" } else { "It failed" }
+    ));
+}
+
+/// The audit resource of commits to the repositories of the roster's `[assistant]` table.
+const ASSISTANT_AUDIT_RESOURCE: &str = "config:assistant";
+
+/// The commit trailer naming Moneypenny and the conversation.
+fn trailer(conversation_id: &str) -> String {
+    format!("Via: Moneypenny (conversation {conversation_id})")
+}
+
+/// Moneypenny's state in one gateway.
+pub(crate) struct Assistant {
+    config: AssistantConfig,
+    desk: Mutex<Desk>,
+    ready: Notify,
+    /// Told when a Station reports shared bases.
+    based: Notify,
+    /// Where every conversation's entries are kept, once the gateway has a Registry.
+    log: OnceLock<log::Sink>,
+}
+
+impl fmt::Debug for Assistant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Assistant")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+fn digest(token: &str) -> String {
+    Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn now() -> f64 {
+    unix_timestamp().unwrap_or(0.0)
+}
+
+impl Assistant {
+    /// The settings it was started with.
+    pub(crate) fn config(&self) -> &AssistantConfig {
+        &self.config
+    }
+
+    pub(crate) fn new(config: AssistantConfig) -> Self {
+        Self {
+            config,
+            desk: Mutex::default(),
+            ready: Notify::new(),
+            based: Notify::new(),
+            log: OnceLock::new(),
+        }
+    }
+
+    /// Keeps every conversation's entries in `registry` from now on.
+    pub(crate) fn start_log(&self, registry: Arc<dyn ai6::RegistryBackend>) {
+        self.log
+            .get_or_init(|| log::start(registry, &self.config.gateway));
+    }
+
+    /// Takes conversation `requested` back from the log when this gateway does not hold it and
+    /// it is `person_id`'s: after a restart, the person finds it as they left it.
+    async fn restore(&self, gateway: &Gateway, person_id: &str, bearer: &str, requested: &str) {
+        if self.log.get().is_none() || self.desk().store.conversations.contains_key(requested) {
+            return;
+        }
+        let Some(registry) = gateway.registry.clone() else {
+            return;
+        };
+        let wanted = requested.to_owned();
+        let Ok(Ok(rows)) =
+            tokio::task::spawn_blocking(move || registry.assistant_log(&wanted)).await
+        else {
+            return;
+        };
+        if rows.first().is_none_or(|first| first.person != person_id) {
+            return;
+        }
+        let limits = &self.config.gateway;
+        let Some(mut conversation) = log::rebuild(
+            &rows,
+            bearer,
+            self.config.bounds(),
+            usize::try_from(limits.event_buffer).unwrap_or(usize::MAX),
+        ) else {
+            return;
+        };
+        conversation.log = self.log.get().cloned();
+        conversation.agent = Some(self.config.agent_id.clone());
+        let mut desk = self.desk();
+        if desk.store.conversations.contains_key(requested) {
+            return;
+        }
+        desk.store.make_room(
+            person_id,
+            now(),
+            limits.conversation_age.as_secs_f64(),
+            limits.conversations_per_person.or_max(),
+            limits.conversations.or_max(),
+        );
+        desk.store
+            .conversations
+            .insert(requested.to_owned(), conversation);
+    }
+
+    /// Waits up to `[assistant.gateway] log_flush_timeout` for the conversation log to keep what
+    /// is still queued; at once when no log was started. What is left is logged.
+    pub(crate) async fn flush_log(&self) {
+        let Some(sink) = self.log.get().cloned() else {
+            return;
+        };
+        let timeout = self.config.gateway.log_flush_timeout;
+        let flushed = tokio::task::spawn_blocking(move || sink.flush(timeout)).await;
+        match flushed {
+            Ok(Ok(())) => {}
+            Ok(Err(left)) => eprintln!(
+                "universal-exports: Moneypenny's log was stopped with {left} entries not kept"
+            ),
+            Err(error) => {
+                eprintln!("universal-exports: Moneypenny's log was not flushed: {error}");
+            }
+        }
+    }
+
+    /// Keeps a tool call of conversation `conversation_id`, or its answer, in its log.
+    pub(crate) fn log_tool(&self, conversation_id: &str, kind: &str, tool: &str, data: &Value) {
+        if let Some(conversation) = self.desk().store.conversations.get_mut(conversation_id) {
+            conversation.record(kind, tool, Some(data), true);
+        }
+    }
+
+    fn desk(&self) -> std::sync::MutexGuard<'_, Desk> {
+        // A panic while holding it leaves bounded maps that are still consistent.
+        self.desk
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Opens `requested` when it is the person's, else a new conversation; returns its ID,
+    /// what the app shows and a subscription to what follows.
+    fn open(
+        &self,
+        person_id: &str,
+        bearer: &str,
+        requested: Option<&str>,
+    ) -> (String, Value, broadcast::Receiver<Value>) {
+        let mut desk = self.desk();
+        let now = now();
+        if let Some(id) = requested
+            && let Some(conversation) = desk.store.owned(id, person_id)
+        {
+            conversation.bearer = bearer.to_owned();
+            return (
+                conversation.id.clone(),
+                ready(conversation, &self.config.views, &self.config.gateway),
+                conversation.events.subscribe(),
+            );
+        }
+        let limits = &self.config.gateway;
+        desk.store.make_room(
+            person_id,
+            now,
+            limits.conversation_age.as_secs_f64(),
+            limits.conversations_per_person.or_max(),
+            limits.conversations.or_max(),
+        );
+        let id = Uuid::new_v4().to_string();
+        let mut conversation = Conversation::new(
+            id.clone(),
+            person_id.to_owned(),
+            bearer.to_owned(),
+            now,
+            usize::try_from(limits.event_buffer).unwrap_or(usize::MAX),
+        );
+        conversation.log = self.log.get().cloned();
+        conversation.agent = Some(self.config.agent_id.clone());
+        let shown = ready(&conversation, &self.config.views, limits);
+        let events = conversation.events.subscribe();
+        desk.store.conversations.insert(id.clone(), conversation);
+        (id, shown, events)
+    }
+
+    /// Queues the person's message for a Station, after the page line of `route` (the app page
+    /// they sent it from, in the route's JSON form) when it is a route.
+    async fn message(
+        &self,
+        gateway: &Gateway,
+        conversation_id: &str,
+        person_id: &str,
+        text: &str,
+        route: Option<&Value>,
+        images: &[images::AppImage],
+    ) -> Result<(), (&'static str, String)> {
+        // A job carries the message whole or not at all: the smaller bound applies.
+        let most = match (
+            self.config.gateway.message_bytes.get(),
+            self.config.limits.message_bytes.get(),
+        ) {
+            (Some(own), Some(job)) => Limit::at(own.min(job)),
+            (Some(bound), None) | (None, Some(bound)) => Limit::at(bound),
+            (None, None) => Limit::UNBOUNDED,
+        };
+        if text.trim().is_empty() || !most.allows(text.len()) {
+            return Err(("bad_request", format!("A message is 1 to {most} bytes.")));
+        }
+        let bearer = self
+            .desk()
+            .store
+            .owned(conversation_id, person_id)
+            .map(|conversation| conversation.bearer.clone())
+            .ok_or(("not_found", "The conversation is gone.".to_owned()))?;
+        // The tools run with this token: a message after it ended starts nothing.
+        resolve_user(gateway, &bearer).await.map_err(|_| {
+            (
+                "unauthorized",
+                "Sign in again to talk to Moneypenny.".to_owned(),
+            )
+        })?;
+        let kept = self.keep_images(gateway, person_id, images)?;
+        let message = match route.and_then(|route| page_line(route, self.config.route_limits())) {
+            Some(line) => format!("{line}\n\n{text}"),
+            None => text.to_owned(),
+        };
+        self.queue(
+            gateway,
+            conversation_id,
+            person_id,
+            &message,
+            Some((text, kept.as_slice())),
+        )
+        .await
+    }
+
+    /// Checks the images of a message against `[assistant.limits]` and keeps them for
+    /// `person_id`; why not, in words for the person.
+    fn keep_images(
+        &self,
+        gateway: &Gateway,
+        person_id: &str,
+        images: &[images::AppImage],
+    ) -> Result<Vec<images::KeptImage>, (&'static str, String)> {
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+        let limits = &self.config.limits;
+        if !limits.images.allows(images.len()) {
+            return Err((
+                "bad_request",
+                format!("A message carries at most {} images.", limits.images),
+            ));
+        }
+        let store = gateway
+            .images
+            .clone()
+            .ok_or(("unavailable", "This gateway keeps no images.".to_owned()))?;
+        images
+            .iter()
+            .map(|image| {
+                let bytes = images::check(image, limits.image_bytes)
+                    .map_err(|reason| ("bad_request", format!("Not sent: {reason}.")))?;
+                store
+                    .put(person_id, &image.media_type, &bytes)
+                    .map_err(|_| ("unavailable", "The image could not be kept.".to_owned()))
+            })
+            .collect()
+    }
+
+    /// Queues `message` for a Station, after any notes for Moneypenny the app left since her
+    /// last message; `shown` is the person's entry and its images, when the person wrote it.
+    async fn queue(
+        &self,
+        gateway: &Gateway,
+        conversation_id: &str,
+        person_id: &str,
+        message: &str,
+        shown: Option<(&str, &[images::KeptImage])>,
+    ) -> Result<(), (&'static str, String)> {
+        let now = now();
+        // The workspace is the person's, as their own sign-in names them.
+        let bearer = self
+            .desk()
+            .store
+            .owned(conversation_id, person_id)
+            .map(|conversation| conversation.bearer.clone())
+            .ok_or(("not_found", "The conversation is gone.".to_owned()))?;
+        let person = resolve_user(gateway, &bearer).await.map_err(|_| {
+            (
+                "unauthorized",
+                "Sign in again to talk to Moneypenny.".to_owned(),
+            )
+        })?;
+        let settings = assistant_settings(gateway).await.map_err(|reason| {
+            (
+                "unavailable",
+                format!("Moneypenny cannot keep a workspace for you: {reason}"),
+            )
+        })?;
+        let workspace = workspace_for(&settings, &person, self.config.gateway.author_chars)
+            .map_err(|reason| {
+                (
+                    "unavailable",
+                    format!("Moneypenny cannot keep a workspace for you: {reason}"),
+                )
+            })?;
+        // Read again for every message, so a narrowed table reaches her next turn: her reach,
+        // and her skills, the catalog's less what the person's group and person tables leave out.
+        let reach = settings.reach_for(&person.id, &person.groups);
+        let skills = settings.skills_for(&person.id, &person.groups);
+        // Read again for every message, so a permission removed reaches her next turn.
+        let cables = cables::grants(gateway, &person, self.config.limits.cable_grants).await;
+        let (remembered, marks) = memory::starting_headers(gateway, &person).await;
+        {
+            let mut desk = self.desk();
+            let conversation = desk
+                .store
+                .owned(conversation_id, person_id)
+                .ok_or(("not_found", "The conversation is gone.".to_owned()))?;
+            if conversation.busy {
+                return Err((
+                    "busy",
+                    "Moneypenny is still answering the last message.".to_owned(),
+                ));
+            }
+            // At most `live_per_person` of the person's conversations hold a harness or wait
+            // for an answer: the least recently used idle harness makes room.
+            let mut others: Vec<(f64, String, bool)> = desk
+                .store
+                .conversations
+                .values()
+                .filter(|other| other.person_id == person_id && other.id != conversation_id)
+                .filter(|other| other.busy || other.live)
+                .map(|other| (other.updated_at, other.id.clone(), other.busy))
+                .collect();
+            let over =
+                (others.len() + 1).saturating_sub(self.config.gateway.live_per_person.or_max());
+            if over > 0 {
+                others.retain(|(_, _, busy)| !busy);
+                if others.len() < over {
+                    return Err((
+                        "busy_elsewhere",
+                        "Moneypenny is answering in your other conversations; wait for one \
+                         to finish."
+                            .to_owned(),
+                    ));
+                }
+                others.sort_by(|a, b| a.0.total_cmp(&b.0));
+                for (_, other, _) in others.into_iter().take(over) {
+                    desk.close_harness(&other, &self.config.agent_id);
+                }
+            }
+            let conversation = desk
+                .store
+                .owned(conversation_id, person_id)
+                .ok_or(("not_found", "The conversation is gone.".to_owned()))?;
+            let marks_kept = gateway
+                .registry
+                .as_ref()
+                .map_or(Limit::UNBOUNDED, |registry| {
+                    registry.limits().sessions.exposures
+                });
+            conversation.note_memory_marks(marks, marks_kept);
+            let mut context = guide::context();
+            let recap = recap(conversation, &self.config);
+            // What is left of the job's bound takes her memory's summaries; she searches for more.
+            let used = context.iter().map(String::len).sum::<usize>()
+                + recap.as_ref().map_or(0, String::len);
+            let room = match self.config.limits.context_bytes.get() {
+                Some(bound) => bound
+                    .saturating_sub(u64::try_from(used).unwrap_or(u64::MAX))
+                    .min(
+                        self.config
+                            .gateway
+                            .memory_context_bytes
+                            .get()
+                            .unwrap_or(u64::MAX),
+                    ),
+                None => self
+                    .config
+                    .gateway
+                    .memory_context_bytes
+                    .get()
+                    .unwrap_or(u64::MAX),
+            };
+            context.extend(memory::starting_summaries(
+                &remembered,
+                Limit::at(room),
+                self.config.gateway.result_chars,
+            ));
+            let mut parts = std::mem::take(&mut conversation.notes);
+            parts.push(message.to_owned());
+            let job = AssistantJob {
+                job_id: Uuid::new_v4().to_string(),
+                conversation_id: conversation_id.to_owned(),
+                agent_id: self.config.agent_id.clone(),
+                message: cut(
+                    &parts.join("\n\n"),
+                    self.config.limits.message_bytes.or_max(),
+                ),
+                context,
+                recap,
+                // Set when the job is placed: the token is bound to its Station.
+                mcp_token: String::new(),
+                token_expires_at: 0.0,
+                session_id: conversation.session_id.clone(),
+                route: conversation.route.clone(),
+                close: false,
+                interrupt: false,
+                person_id: Some(person_id.to_owned()),
+                workspace,
+                commit: None,
+                cables,
+                cable_confirm: None,
+                cable_discard: None,
+                reach,
+                skills,
+                // The person's directory groups, so the Station applies its per-group narrowing.
+                groups: Some(person.groups.clone()),
+                images: shown
+                    .map(|(_, images)| images)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|image| ai6::AssistantImage {
+                        sha256: image.sha256.clone(),
+                        media_type: image.media_type.clone(),
+                        bytes: image.bytes,
+                    })
+                    .collect(),
+            };
+            // A new turn: proposals made from here rest on what she reads from here.
+            conversation.turn_reads.clear();
+            if let Some((text, kept)) = shown {
+                conversation.push(
+                    Entry {
+                        role: Role::Person,
+                        text: text.to_owned(),
+                        at: now,
+                        data: (!kept.is_empty()).then(|| images::KeptImage::data(kept)),
+                    },
+                    self.config.bounds(),
+                );
+            }
+            conversation.answered = false;
+            conversation.set_busy(true);
+            conversation.pending = Some(Pending {
+                job,
+                station: None,
+                taken_at: None,
+                queued_at: now,
+                refused_by: Vec::new(),
+                reason: None,
+            });
+        }
+        self.ready.notify_waiters();
+        self.place(gateway, conversation_id).await;
+        Ok(())
+    }
+
+    /// Queues the conversation's pending job for the Station that runs its harness, else the
+    /// Headquarters Station, else any healthy Station that has not refused it.
+    async fn place(&self, gateway: &Gateway, conversation_id: &str) {
+        let (preferred, refused) = {
+            let mut desk = self.desk();
+            let Some(conversation) = desk.store.conversations.get_mut(conversation_id) else {
+                return;
+            };
+            let Some(pending) = &conversation.pending else {
+                return;
+            };
+            (conversation.station.clone(), pending.refused_by.clone())
+        };
+        let healthy = healthy_stations(gateway).await;
+        let chosen = preferred
+            .filter(|station| healthy.contains(station))
+            .into_iter()
+            .chain(healthy)
+            .find(|station| !refused.contains(station));
+        let mut desk = self.desk();
+        let max_entries = self.config.bounds();
+        let Some(conversation) = desk.store.conversations.get_mut(conversation_id) else {
+            return;
+        };
+        let Some(pending) = conversation.pending.as_mut() else {
+            return;
+        };
+        match chosen {
+            Some(station) => {
+                // The harness on that Station keeps its token while it lasts; a new one is
+                // made for a new Station or before the old one runs out, and the tokens of
+                // any other Station are withdrawn, so a harness left there stops working.
+                let now = now();
+                let reuse = conversation
+                    .token
+                    .clone()
+                    .filter(|(_, held_by, expires_at)| {
+                        *held_by == station
+                            && *expires_at
+                                > now + self.config.gateway.token_reuse_margin.0.as_secs_f64()
+                    });
+                let (token, expires_at) = match reuse {
+                    Some((token, _, expires_at)) => (token, expires_at),
+                    None => (
+                        format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()),
+                        now + self.config.gateway.token_ttl.0.as_secs_f64(),
+                    ),
+                };
+                conversation.token = Some((token.clone(), station.clone(), expires_at));
+                pending.job.mcp_token = token.clone();
+                pending.job.token_expires_at = expires_at;
+                pending.station = Some(station.clone());
+                pending.taken_at = None;
+                pending.queued_at = now;
+                let person_id = conversation.person_id.clone();
+                let deadline = self.config.gateway.answer_deadline.0.as_secs_f64();
+                let Desk { store, tokens, .. } = &mut *desk;
+                tokens.retain(|key, grant| {
+                    let current = grant.expires_at > now
+                        || store
+                            .conversations
+                            .get(&grant.conversation_id)
+                            .is_some_and(|held| held.outlasts_its_token(key, now, deadline));
+                    current
+                        && (grant.conversation_id != conversation_id || grant.station == station)
+                });
+                desk.tokens.insert(
+                    digest(&token),
+                    Grant {
+                        conversation_id: conversation_id.to_owned(),
+                        person_id,
+                        station,
+                        expires_at,
+                    },
+                );
+                drop(desk);
+                self.ready.notify_waiters();
+            }
+            None => {
+                let reason = pending
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "no Station is checking in".to_owned());
+                conversation.pending = None;
+                conversation.push(
+                    Entry {
+                        role: Role::Error,
+                        text: format!("No Station can run Moneypenny now: {reason}."),
+                        at: now(),
+                        data: None,
+                    },
+                    max_entries,
+                );
+                conversation.set_busy(false);
+            }
+        }
+    }
+
+    /// Gives up on jobs their Station did not take up in time and offers them elsewhere. Run
+    /// by every Station poll and by every open conversation socket, so a job is moved on
+    /// even when no Station polls at all.
+    async fn sweep(&self, gateway: &Gateway) {
+        let timeout = self.config.gateway.answer_timeout.0.as_secs_f64();
+        let now = now();
+        let mut again = Vec::new();
+        {
+            let mut desk = self.desk();
+            for conversation in desk.store.conversations.values_mut() {
+                let Some(pending) = conversation.pending.as_mut() else {
+                    continue;
+                };
+                let since = pending.taken_at.unwrap_or(pending.queued_at);
+                if let Some(late) = pending.station.clone()
+                    && now - since > timeout
+                {
+                    pending.refused_by.push(late);
+                    pending.reason = Some("the Station did not answer".to_owned());
+                    pending.station = None;
+                    again.push(conversation.id.clone());
+                }
+            }
+            // An accepted message whose Station went quiet is given up, so the conversation
+            // can take another message and be evicted like any idle one.
+            let deadline = self.config.gateway.answer_deadline.0.as_secs_f64();
+            let bounds = self.config.bounds();
+            for conversation in desk.store.conversations.values_mut() {
+                if conversation.busy
+                    && conversation.pending.is_none()
+                    && now - conversation.heard_at > deadline
+                {
+                    conversation.live = false;
+                    conversation.push(
+                        Entry {
+                            role: Role::Error,
+                            text: "No word from Moneypenny's Station for too long; her answer \
+                                   was given up. Ask again."
+                                .to_owned(),
+                            at: now,
+                            data: None,
+                        },
+                        bounds,
+                    );
+                    conversation.set_busy(false);
+                }
+            }
+        }
+        for conversation in again {
+            self.place(gateway, &conversation).await;
+        }
+        self.expire_confirms(gateway).await;
+    }
+
+    /// The next job for `station`: a close or interrupt first, then the oldest message.
+    async fn take(&self, gateway: &Gateway, station: &str) -> Option<AssistantJob> {
+        self.sweep(gateway).await;
+        let now = now();
+        let mut desk = self.desk();
+        if let Some(index) = desk
+            .controls
+            .iter()
+            .position(|(held_by, _)| held_by == station)
+        {
+            return Some(desk.controls.remove(index).1);
+        }
+        desk.store
+            .conversations
+            .values_mut()
+            .filter_map(|conversation| conversation.pending.as_mut())
+            .filter(|pending| {
+                pending.station.as_deref() == Some(station) && pending.taken_at.is_none()
+            })
+            .min_by(|a, b| a.queued_at.total_cmp(&b.queued_at))
+            .map(|pending| {
+                pending.taken_at = Some(now);
+                pending.job.clone()
+            })
+    }
+
+    /// Applies a Station's report; `Err` with the HTTP status it earns.
+    async fn report(&self, gateway: &Gateway, report: AssistantReport) -> Result<(), StatusCode> {
+        if !self.config.limits.events.allows(report.events.len())
+            || !ai6::directorates::section_00::assistant::valid_identity(&report.station_id)
+        {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let max_entries = self.config.bounds();
+        let mut refused = false;
+        let mut based = false;
+        let mut after = cables::After::default();
+        'locked: {
+            let mut desk = self.desk();
+            if let Some(job_id) = &report.job_id
+                && let Some((given_to, _)) = desk.controlling.get(job_id)
+            {
+                // Only the Station the job was given to answers it.
+                if *given_to != report.station_id {
+                    return Err(StatusCode::FORBIDDEN);
+                }
+                let Some((_, control)) = desk.controlling.remove(job_id) else {
+                    break 'locked;
+                };
+                desk.cable_deadlines.remove(job_id);
+                // The answer to a close or an interrupt: the harness reports `closed` when it
+                // is gone and `interrupted` when its turn stops. An interrupt the Station could
+                // not make is shown, since the answer goes on.
+                let refused = report
+                    .events
+                    .first()
+                    .filter(|event| event.kind == EVENT_REJECTED);
+                if control == Control::Interrupt
+                    && let Some(refused) = refused
+                    && let Some(conversation) =
+                        desk.store.conversations.get_mut(&report.conversation_id)
+                {
+                    conversation.push(
+                        Entry {
+                            role: Role::Error,
+                            text: format!(
+                                "Moneypenny could not be stopped: {}",
+                                or_unknown(refused.text.as_deref().unwrap_or_default())
+                            ),
+                            at: now(),
+                            data: None,
+                        },
+                        max_entries,
+                    );
+                }
+                let conversation = desk.store.conversations.get_mut(&report.conversation_id);
+                match (control, conversation) {
+                    (Control::Commit { proposal, what }, Some(conversation)) => {
+                        committed(
+                            conversation,
+                            proposal.as_deref(),
+                            &what,
+                            &report,
+                            max_entries,
+                        );
+                    }
+                    (Control::CableConfirm(proposal), Some(conversation)) => {
+                        let reason = refused.map(|event| event.text.clone().unwrap_or_default());
+                        cables::answered(conversation, &proposal, reason, &mut after);
+                    }
+                    _ => {}
+                }
+                break 'locked;
+            }
+            let conversation = desk
+                .store
+                .conversations
+                .get_mut(&report.conversation_id)
+                .ok_or(StatusCode::NOT_FOUND)?;
+            // A harness cut off by a Stop is heard only for the Cables it sent, so each is
+            // audited; nothing else it says reaches the conversation.
+            if report.job_id.is_none()
+                && conversation.cut_off.as_deref() == Some(report.station_id.as_str())
+            {
+                conversation.hear_run(&report);
+                for event in report
+                    .events
+                    .iter()
+                    .filter(|event| event.kind == EVENT_CABLE_SENT)
+                {
+                    cables::apply(
+                        conversation,
+                        event,
+                        &report.station_id,
+                        max_entries,
+                        &self.config,
+                        &mut after,
+                    );
+                }
+                conversation.reporting = None;
+                break 'locked;
+            }
+            conversation.heard_at = now();
+            if let Some(job_id) = &report.job_id {
+                let pending = conversation
+                    .pending
+                    .as_mut()
+                    .filter(|pending| {
+                        pending.job.job_id == *job_id
+                            && pending.station.as_deref() == Some(report.station_id.as_str())
+                    })
+                    .ok_or(StatusCode::CONFLICT)?;
+                let answer = report.events.first().ok_or(StatusCode::BAD_REQUEST)?;
+                match answer.kind.as_str() {
+                    EVENT_ACCEPTED => {
+                        conversation.pending = None;
+                        conversation.live = true;
+                        if conversation.cut_off.as_deref() == Some(report.station_id.as_str()) {
+                            conversation.cut_off = None;
+                        }
+                        if conversation.station.as_deref() != Some(report.station_id.as_str()) {
+                            conversation.station = Some(report.station_id.clone());
+                        }
+                    }
+                    EVENT_REJECTED => {
+                        pending.refused_by.push(report.station_id.clone());
+                        pending.reason = answer.text.clone();
+                        pending.station = None;
+                        refused = true;
+                    }
+                    _ => return Err(StatusCode::BAD_REQUEST),
+                }
+            } else if conversation.station.as_deref() != Some(report.station_id.as_str()) {
+                return Err(StatusCode::FORBIDDEN);
+            }
+            conversation.hear_run(&report);
+            if let Some(session_id) = report
+                .session_id
+                .filter(|id| ai6::directorates::section_00::assistant::valid_identity(id))
+            {
+                conversation.session_id = Some(session_id);
+                conversation.route = report.route.clone();
+            }
+            for event in report
+                .events
+                .iter()
+                .filter(|event| report.job_id.is_none() || event.kind != EVENT_ACCEPTED)
+            {
+                if !event.shared.is_empty() {
+                    conversation.keep_shared_bases(&event.shared, self.config.limits.shared_bases);
+                    based = true;
+                }
+                match event.kind.as_str() {
+                    EVENT_CABLE_PROPOSAL | EVENT_CABLE_SENT => cables::apply(
+                        conversation,
+                        event,
+                        &report.station_id,
+                        max_entries,
+                        &self.config,
+                        &mut after,
+                    ),
+                    _ => apply(conversation, event, max_entries),
+                }
+            }
+            conversation.reporting = None;
+            if let Some(conversation) = desk.store.conversations.get(&report.conversation_id) {
+                let person = conversation.person_id.clone();
+                desk.store
+                    .trim_person(&person, self.config.gateway.person_bytes.or_max());
+            }
+        }
+        self.follow_up(gateway, after).await;
+        if based {
+            self.based.notify_waiters();
+        }
+        if refused {
+            self.place(gateway, &report.conversation_id).await;
+        }
+        Ok(())
+    }
+
+    /// The conversation `token` serves, its person and the person's access token, while the
+    /// token is accepted.
+    pub(crate) fn grant(&self, token: &str) -> Option<Granted> {
+        let mut desk = self.desk();
+        let now = now();
+        let key = digest(token);
+        let grant = desk.tokens.get(&key)?;
+        let over = grant.expires_at <= now;
+        let (conversation_id, person_id) = (grant.conversation_id.clone(), grant.person_id.clone());
+        let conversation = desk.store.owned(&conversation_id, &person_id)?;
+        let deadline = self.config.gateway.answer_deadline.0.as_secs_f64();
+        if over && !conversation.outlasts_its_token(&key, now, deadline) {
+            return None;
+        }
+        Some(Granted {
+            conversation_id,
+            person_id,
+            bearer: conversation.bearer.clone(),
+        })
+    }
+
+    /// Runs Moneypenny's write tool `tool`: checks the input and that the person may do it,
+    /// then records a proposal for the person to confirm. Nothing else happens.
+    pub(crate) async fn propose(
+        &self,
+        gateway: &Gateway,
+        granted: &Granted,
+        tool: &actions::WriteTool,
+        input: &Value,
+    ) -> tools::Outcome {
+        let id = format!("proposal-{}", Uuid::new_v4().simple());
+        // An edit of her own settings is shown against the settings in force.
+        let current = match input.as_object() {
+            Some(fields) if actions::edits_assistant(tool.name, fields) => {
+                assistant_settings(gateway).await.ok()
+            }
+            _ => None,
+        };
+        let draft = match tool.draft(input, &id, current.as_ref()) {
+            Ok(draft) => draft,
+            Err(outcome) => return outcome,
+        };
+        let Ok(person) = resolve_user(gateway, &granted.bearer).await else {
+            return tools::Outcome::error("The person's sign-in has ended; nothing was proposed.");
+        };
+        if authorize_resource_action(gateway, person, draft.scope.resource(), draft.action)
+            .await
+            .is_err()
+        {
+            return tools::Outcome::error(format!(
+                "Refused: the person may not {} on {}, so nothing was proposed. Tell them so; \
+                 do not try another way.",
+                draft.action,
+                draft.scope.resource()
+            ));
+        }
+        let summary = draft.summary.clone();
+        let proposal = actions::Proposal {
+            id: id.clone(),
+            tool: tool.name,
+            draft,
+            status: "pending",
+            created_at: now(),
+            session: digest(&granted.bearer),
+            result: None,
+            work: None,
+            cable: None,
+            evidence: actions::Evidence::default(),
+        };
+        let max_entries = self.config.bounds();
+        {
+            let mut desk = self.desk();
+            let Some(conversation) = desk
+                .store
+                .owned(&granted.conversation_id, &granted.person_id)
+            else {
+                return tools::Outcome::error("The conversation is gone.");
+            };
+            if !record_proposal(conversation, proposal, max_entries, &self.config.gateway) {
+                return tools::Outcome::error(proposals_full(&self.config.gateway));
+            }
+        }
+        tools::Outcome {
+            text: format!(
+                "Proposed as {id}: {summary}. Nothing has changed. The person confirms or \
+                 cancels it in the app; you will be told which."
+            ),
+            is_error: false,
+        }
+    }
+
+    /// Runs a pending proposal the person confirmed on a socket signed in with `token`, the
+    /// session it was proposed in, and tells Moneypenny how it went.
+    async fn confirm(
+        &self,
+        gateway: &Gateway,
+        conversation_id: &str,
+        person: &ai6::Person,
+        token: &str,
+        proposal_id: &str,
+    ) -> Result<(), (&'static str, String)> {
+        let draft = {
+            let mut desk = self.desk();
+            let conversation = desk
+                .store
+                .owned(conversation_id, &person.id)
+                .ok_or(("not_found", "The conversation is gone.".to_owned()))?;
+            expire_proposals(conversation, &self.config.gateway);
+            let proposal = conversation
+                .proposals
+                .iter_mut()
+                .find(|proposal| proposal.id == proposal_id)
+                .ok_or(("not_found", "There is no such proposal.".to_owned()))?;
+            if proposal.status != "pending" {
+                return Err(("conflict", format!("The proposal is {}.", proposal.status)));
+            }
+            if proposal.session != digest(token) {
+                return Err((
+                    "forbidden",
+                    "Only the signed-in session it was proposed in can confirm it.".to_owned(),
+                ));
+            }
+            proposal.status = "confirming";
+            let shown = proposal.clone();
+            conversation.show_proposal(&shown);
+            shown
+        };
+        if let Some(commit) = draft.work.clone() {
+            self.confirm_commit(gateway, conversation_id, person, &draft, commit)
+                .await;
+            return Ok(());
+        }
+        // A held Cable is sent by the Station that holds it, which reports how it went.
+        if let Some(hold) = draft.cable.clone() {
+            self.confirm_cable(gateway, conversation_id, person, &draft, hold)
+                .await;
+            return Ok(());
+        }
+        let outcome = self
+            .execute(gateway, conversation_id, person, token, &draft)
+            .await;
+        let (status, result) = match &outcome {
+            Ok((text, _)) => ("done", text.clone()),
+            Err(text) => ("failed", text.clone()),
+        };
+        let note = format!(
+            "[App: the person confirmed {} ({}). {}]",
+            draft.id, draft.draft.summary, result
+        );
+        let idle = {
+            let mut desk = self.desk();
+            let Some(conversation) = desk.store.owned(conversation_id, &person.id) else {
+                return Ok(());
+            };
+            if let Some(proposal) = conversation
+                .proposals
+                .iter_mut()
+                .find(|proposal| proposal.id == proposal_id)
+            {
+                proposal.status = status;
+                proposal.result = Some(result);
+                let shown = proposal.clone();
+                conversation.show_proposal(&shown);
+            }
+            // The app, and only the app, is told the new password, once; it is in no entry.
+            if let Ok((_, Some(secret))) = &outcome {
+                let _ = conversation.events.send(serde_json::json!({
+                    "type": "reveal", "proposal": proposal_id, "secret": secret
+                }));
+            }
+            if conversation.busy {
+                conversation.notes.push(note.clone());
+                false
+            } else {
+                true
+            }
+        };
+        // The result goes back to Moneypenny: now when she is idle, else with the next message.
+        if idle {
+            let _ = self
+                .queue(gateway, conversation_id, &person.id, &note, None)
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Audits a confirmed commit proposal, then asks a Station to make the commit; the
+    /// Station's answer settles the proposal ([`Self::report`]). One that cannot be audited
+    /// or sent fails here.
+    async fn confirm_commit(
+        &self,
+        gateway: &Gateway,
+        conversation_id: &str,
+        person: &ai6::Person,
+        proposal: &actions::Proposal,
+        commit: AssistantCommit,
+    ) {
+        let target = format!(
+            "{conversation_id} {} {} {}",
+            proposal.id, proposal.tool, proposal.draft.call.path
+        );
+        let sent = match audit(
+            gateway,
+            person,
+            "moneypenny.confirmed",
+            String::new(),
+            Some(ASSISTANT_AUDIT_RESOURCE.to_owned()),
+            &target,
+        )
+        .await
+        {
+            Ok(()) => self
+                .commit_station(gateway, conversation_id)
+                .await
+                .ok_or_else(|| "no Station is checking in".to_owned()),
+            Err(reason) => Err(reason),
+        };
+        let mut desk = self.desk();
+        match sent {
+            Ok(station) => {
+                // Checked against the person's groups as they are now.
+                let groups = Some(person.groups.clone());
+                desk.queue_commit(
+                    conversation_id,
+                    &self.config.agent_id,
+                    station,
+                    (commit, groups),
+                    Control::Commit {
+                        proposal: Some(proposal.id.clone()),
+                        what: proposal.draft.summary.clone(),
+                    },
+                );
+                drop(desk);
+                self.ready.notify_waiters();
+            }
+            Err(reason) => {
+                if let Some(conversation) = desk.store.owned(conversation_id, &person.id) {
+                    settle(conversation, &proposal.id, false, &reason);
+                }
+            }
+        }
+    }
+
+    /// The Station a commit of `conversation_id` goes to: the one running its harness when
+    /// it is healthy, else the first healthy one.
+    async fn commit_station(&self, gateway: &Gateway, conversation_id: &str) -> Option<String> {
+        let preferred = self
+            .desk()
+            .store
+            .conversations
+            .get(conversation_id)
+            .and_then(|conversation| conversation.station.clone());
+        let healthy = healthy_stations(gateway).await;
+        preferred
+            .filter(|station| healthy.contains(station))
+            .or_else(|| healthy.into_iter().next())
+    }
+
+    /// Records a read tool call of the turn, which a proposal then lists.
+    pub(crate) fn note_read(
+        &self,
+        conversation_id: &str,
+        tool: &str,
+        ids: std::collections::BTreeMap<String, String>,
+    ) {
+        if let Some(conversation) = self.desk().store.conversations.get_mut(conversation_id) {
+            conversation.note_read(tool, ids, &self.config.gateway);
+        }
+    }
+
+    /// Whether `station` runs the conversation: `404` for one this gateway does not hold, `403`
+    /// for one another Station runs.
+    fn run_by(&self, station: &str, conversation_id: &str) -> Result<(), ApiError> {
+        let desk = self.desk();
+        let conversation = desk
+            .store
+            .conversations
+            .get(conversation_id)
+            .ok_or_else(ApiError::not_found)?;
+        if conversation.station.as_deref() != Some(station) {
+            return Err(ApiError::forbidden());
+        }
+        Ok(())
+    }
+
+    /// Runs [`actions::SHARED_CHANGE`]: a change to one file of a shared repository of a
+    /// group the person is in, proposed, or sent at once (audited `moneypenny.shared.write`)
+    /// when the deployment lets that group's changes through. The change carries what the
+    /// file held when she made the call ([`Self::shared_base`]), so its commit is refused when
+    /// the repository's `main` has changed the file since; a call without one is refused.
+    pub(crate) async fn propose_shared(
+        &self,
+        gateway: &Gateway,
+        granted: &Granted,
+        input: &Value,
+    ) -> tools::Outcome {
+        let (group, path, content, message) =
+            match actions::shared_change(input, &self.config.limits, &self.config.gateway) {
+                Ok(change) => change,
+                Err(outcome) => return outcome,
+            };
+        let Ok(person) = resolve_user(gateway, &granted.bearer).await else {
+            return tools::Outcome::error("The person's sign-in has ended; nothing was proposed.");
+        };
+        let settings = match assistant_settings(gateway).await {
+            Ok(settings) => settings,
+            Err(reason) => return tools::Outcome::error(format!("Nothing was proposed: {reason}")),
+        };
+        let Some(shared) = settings.shared_named(group, &person.groups) else {
+            return tools::Outcome::error(format!(
+                "Refused: the person is not a member of {group:?}, or it shares no repository, \
+                 so nothing was proposed. Tell them so; do not try another way."
+            ));
+        };
+        let Some(base) = self
+            .shared_base(&granted.conversation_id, group, path, content)
+            .await
+        else {
+            return tools::Outcome::error(format!(
+                "Nothing was proposed: the Station running this conversation did not say what \
+                 {path} held in shared/{group}/ when you called, so a change made to it since \
+                 could not be caught. Check that shared/{group}/ is in your workspace, then \
+                 call again."
+            ));
+        };
+        let (author_name, author_email) = author_of(&person, self.config.gateway.author_chars);
+        let commit = AssistantCommit {
+            repo: shared.repo().to_owned(),
+            group: group.to_owned(),
+            change: AssistantChange::based(
+                std::collections::BTreeMap::from([(path.to_owned(), Some(content.to_owned()))]),
+                std::collections::BTreeMap::from([(path.to_owned(), base)]),
+            ),
+            message: format!("{message}\n\n{}", trailer(&granted.conversation_id)),
+            author_name,
+            author_email,
+        };
+        let summary = format!("Write {path} in {group}'s shared repository: {message}");
+        if shared.write() {
+            let target = format!("{} {group} {path}", granted.conversation_id);
+            if let Err(reason) = audit(
+                gateway,
+                &person,
+                "moneypenny.shared.write",
+                String::new(),
+                Some(ASSISTANT_AUDIT_RESOURCE.to_owned()),
+                &target,
+            )
+            .await
+            {
+                return tools::Outcome::error(format!("Nothing was written: {reason}."));
+            }
+            let Some(station) = self.commit_station(gateway, &granted.conversation_id).await else {
+                return tools::Outcome::error("Nothing was written: no Station is checking in.");
+            };
+            let mut desk = self.desk();
+            desk.queue_commit(
+                &granted.conversation_id,
+                &self.config.agent_id,
+                station,
+                (commit, Some(person.groups.clone())),
+                Control::Commit {
+                    proposal: None,
+                    what: summary,
+                },
+            );
+            drop(desk);
+            self.ready.notify_waiters();
+            return tools::Outcome {
+                text: format!(
+                    "Sent to be committed to {group}'s repository at once: the deployment lets \
+                     {group}'s changes through without a confirmation. You will be told how it \
+                     went."
+                ),
+                is_error: false,
+            };
+        }
+        let proposal = commit_proposal(
+            actions::SHARED_CHANGE,
+            digest(&granted.bearer),
+            format!("{group} shared repository: {path}"),
+            actions::Scope::Resource(format!("group:{group}")),
+            "membership",
+            summary.clone(),
+            commit,
+        );
+        let id = proposal.id.clone();
+        let bounds = self.config.bounds();
+        let mut desk = self.desk();
+        let Some(conversation) = desk
+            .store
+            .owned(&granted.conversation_id, &granted.person_id)
+        else {
+            return tools::Outcome::error("The conversation is gone.");
+        };
+        if !record_proposal(conversation, proposal, bounds, &self.config.gateway) {
+            return tools::Outcome::error(proposals_full(&self.config.gateway));
+        }
+        tools::Outcome {
+            text: format!(
+                "Proposed as {id}: {summary}. Nothing has changed. The person confirms or \
+                 cancels it in the app; you will be told which."
+            ),
+            is_error: false,
+        }
+    }
+
+    /// What the file `path` of `group`'s repository held when the conversation's call that
+    /// writes `content` to it was made, as its Station reported it ([`ai6::AssistantSharedBase`]):
+    /// its hex SHA-256, or `None` for no such file. The report and the call reach the gateway
+    /// separately, so this waits up to `[assistant.gateway] shared_base_wait` for it; `None`
+    /// when none came.
+    async fn shared_base(
+        &self,
+        conversation_id: &str,
+        group: &str,
+        path: &str,
+        content: &str,
+    ) -> Option<Option<String>> {
+        let content = digest(content);
+        let deadline = tokio::time::Instant::now() + self.config.gateway.shared_base_wait.0;
+        loop {
+            let notified = self.based.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let taken = self
+                .desk()
+                .store
+                .conversations
+                .get_mut(conversation_id)
+                .and_then(|conversation| conversation.take_shared_base(group, path, &content));
+            if let Some(taken) = taken {
+                return Some(taken.base);
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return None;
+            }
+        }
+    }
+
+    /// Audits, then sends, a confirmed proposal's request as the person; the text is what
+    /// AI6 answered, wrapped as data, or why it did not run.
+    async fn execute(
+        &self,
+        gateway: &Gateway,
+        conversation_id: &str,
+        person: &ai6::Person,
+        token: &str,
+        proposal: &actions::Proposal,
+    ) -> Result<(String, Option<String>), String> {
+        let (operation, resource) = match &proposal.draft.scope {
+            actions::Scope::Operation(operation) => (operation.clone(), None),
+            actions::Scope::Resource(resource) => (String::new(), Some(resource.clone())),
+        };
+        let target = format!(
+            "{conversation_id} {} {} {}",
+            proposal.id, proposal.tool, proposal.draft.call.path
+        );
+        // Recorded before it runs: a confirmation that cannot be audited is not carried out.
+        audit(
+            gateway,
+            person,
+            "moneypenny.confirmed",
+            operation,
+            resource,
+            &target,
+        )
+        .await?;
+        match tools::route(gateway, token, &proposal.draft.call).await {
+            Ok((status, mut value)) if status.is_success() => {
+                // A password made for an account goes to the person's app only, never into
+                // what she reads.
+                let secret = (proposal.tool == "propose_account_change")
+                    .then(|| value.as_object_mut()?.remove("secret"))
+                    .flatten()
+                    .and_then(|secret| secret.as_str().map(str::to_owned));
+                let shown = format!(
+                    "AI6 answered {}: {}",
+                    status.as_u16(),
+                    tools::wrap(proposal.tool, &value, self.config.gateway.result_chars)
+                );
+                Ok((shown, secret))
+            }
+            Ok((status, value)) => Err(tools::refusal(
+                status,
+                &value,
+                self.config.gateway.result_chars,
+            )),
+            Err(error) => Err(format!("The request failed: {error}")),
+        }
+    }
+
+    /// Shows a view Moneypenny built, when it is exactly the view schema; otherwise tells her
+    /// why and shows nothing.
+    pub(crate) fn show(&self, granted: &Granted, input: &Value) -> tools::Outcome {
+        let view = match views::parse(input, &self.config.views, self.config.route_limits()) {
+            Ok(view) => view,
+            Err(reason) => {
+                return tools::Outcome::error(format!(
+                    "View refused: {reason}. Nothing was shown; fix the view and call show again."
+                ));
+            }
+        };
+        let id = format!("view-{}", Uuid::new_v4().simple());
+        let max_entries = self.config.bounds();
+        let mut desk = self.desk();
+        let Some(conversation) = desk
+            .store
+            .owned(&granted.conversation_id, &granted.person_id)
+        else {
+            return tools::Outcome::error("The conversation is gone.");
+        };
+        let data = json!({"id": id, "view": view});
+        conversation.push(
+            Entry {
+                role: Role::View,
+                text: view.title.clone().unwrap_or_default(),
+                at: now(),
+                data: Some(data),
+            },
+            max_entries,
+        );
+        desk.store.trim_person(
+            &granted.person_id,
+            self.config.gateway.person_bytes.or_max(),
+        );
+        tools::Outcome {
+            text: format!("Shown to the person as {id}."),
+            is_error: false,
+        }
+    }
+
+    /// Offers the person an app page, when `input` is `{"to": ROUTE, "label": TEXT}` with a
+    /// valid route; otherwise tells her why and offers nothing. It changes nothing, so it is
+    /// not audited.
+    pub(crate) fn navigate(&self, granted: &Granted, input: &Value) -> tools::Outcome {
+        let (route, label) = match navigation(input, &self.config) {
+            Ok(navigation) => navigation,
+            Err(reason) => {
+                return tools::Outcome::error(format!("Navigation refused: {reason}"));
+            }
+        };
+        let id = format!("nav-{}", Uuid::new_v4().simple());
+        let max_entries = self.config.bounds();
+        let mut desk = self.desk();
+        let Some(conversation) = desk
+            .store
+            .owned(&granted.conversation_id, &granted.person_id)
+        else {
+            return tools::Outcome::error("The conversation is gone.");
+        };
+        let data = json!({"id": id, "route": route.to_json(), "label": label});
+        conversation.push(
+            Entry {
+                role: Role::Navigation,
+                text: label,
+                at: now(),
+                data: Some(data),
+            },
+            max_entries,
+        );
+        desk.store.trim_person(
+            &granted.person_id,
+            self.config.gateway.person_bytes.or_max(),
+        );
+        tools::Outcome {
+            text: format!("Offered to the person as {id}; the page opens when they choose it."),
+            is_error: false,
+        }
+    }
+
+    /// Turns a submitted form into a proposal of its tool, made in this socket's session.
+    async fn submit(
+        &self,
+        gateway: &Gateway,
+        conversation_id: &str,
+        person_id: &str,
+        token: &str,
+        view_id: &str,
+        values: &serde_json::Map<String, Value>,
+    ) -> Result<(), (&'static str, String)> {
+        let view = {
+            let mut desk = self.desk();
+            let conversation = desk
+                .store
+                .owned(conversation_id, person_id)
+                .ok_or(("not_found", "The conversation is gone.".to_owned()))?;
+            let id = Value::String(view_id.to_owned());
+            conversation
+                .entries
+                .iter()
+                .filter(|entry| entry.role == Role::View)
+                .filter_map(|entry| entry.data.as_ref())
+                .find(|data| data.get("id") == Some(&id))
+                .and_then(|data| serde_json::from_value::<views::View>(data["view"].clone()).ok())
+                .ok_or(("not_found", "There is no such view.".to_owned()))?
+        };
+        let (tool, input) =
+            views::form_input(&view, values).map_err(|reason| ("bad_request", reason))?;
+        let tool = actions::write_tools()
+            .iter()
+            .find(|write| write.name == tool)
+            .ok_or(("bad_request", "The form names no tool.".to_owned()))?;
+        let granted = Granted {
+            conversation_id: conversation_id.to_owned(),
+            person_id: person_id.to_owned(),
+            bearer: token.to_owned(),
+        };
+        let outcome = self.propose(gateway, &granted, tool, &input).await;
+        if outcome.is_error {
+            return Err(("refused", outcome.text));
+        }
+        if let Some(conversation) = self.desk().store.owned(conversation_id, person_id) {
+            conversation.notes.push(format!(
+                "[App: the person submitted the form of {view_id}. {}]",
+                outcome.text
+            ));
+        }
+        Ok(())
+    }
+    /// Cancels a pending proposal; Moneypenny hears of it with the next message.
+    fn cancel(
+        &self,
+        conversation_id: &str,
+        person_id: &str,
+        proposal_id: &str,
+    ) -> Result<(), (&'static str, String)> {
+        let mut desk = self.desk();
+        let conversation = desk
+            .store
+            .owned(conversation_id, person_id)
+            .ok_or(("not_found", "The conversation is gone.".to_owned()))?;
+        let proposal = conversation
+            .proposals
+            .iter_mut()
+            .find(|proposal| proposal.id == proposal_id && proposal.status == "pending")
+            .ok_or(("not_found", "There is no such pending proposal.".to_owned()))?;
+        proposal.status = "cancelled";
+        let shown = proposal.clone();
+        conversation.notes.push(format!(
+            "[App: the person cancelled {proposal_id} ({}).]",
+            shown.draft.summary
+        ));
+        conversation.show_proposal(&shown);
+        drop(desk);
+        // A held Cable is dropped by the Station that holds it.
+        if let Some(hold) = shown.cable {
+            self.discard_cable(conversation_id, proposal_id, hold);
+        }
+        Ok(())
+    }
+
+    /// Stops the answer the person's conversation waits for: a message no harness has yet is
+    /// withdrawn, and the Station whose harness is answering is asked to interrupt it, which it
+    /// reports as `interrupted`. `Ok(false)` when nothing is being answered.
+    fn interrupt(
+        &self,
+        conversation_id: &str,
+        person_id: &str,
+    ) -> Result<bool, (&'static str, String)> {
+        let bounds = self.config.bounds();
+        let mut desk = self.desk();
+        let conversation = desk
+            .store
+            .owned(conversation_id, person_id)
+            .ok_or(("not_found", "The conversation is gone.".to_owned()))?;
+        if !conversation.busy {
+            return Ok(false);
+        }
+        conversation
+            .notes
+            .push("[App: the person stopped your last answer.]".to_owned());
+        let station = conversation.station.clone();
+        if let Some(pending) = conversation.pending.take() {
+            // A Station that already took the withdrawn message has its late `accepted`
+            // refused, which makes it close the harness it started. Meanwhile that harness is
+            // cut off: its tool token is withdrawn and its Cable calls are refused.
+            let taken = pending.taken_at.and(pending.station);
+            if let Some(taken_by) = &taken {
+                if station.as_ref() == Some(taken_by) {
+                    conversation.live = false;
+                }
+                conversation.token = None;
+                conversation.cut_off = Some(taken_by.clone());
+            }
+            stopped(conversation, bounds);
+            if taken.is_some() {
+                desk.tokens
+                    .retain(|_, grant| grant.conversation_id != conversation_id);
+            }
+            return Ok(true);
+        }
+        if station.is_none() {
+            stopped(conversation, bounds);
+            return Ok(true);
+        }
+        conversation.stopping = true;
+        let job = control_job(
+            conversation,
+            &self.config.agent_id,
+            &Control::Interrupt,
+            None,
+        );
+        let asked = desk
+            .controls
+            .iter()
+            .any(|(_, queued)| queued.interrupt && queued.conversation_id == conversation_id);
+        if !asked && let Some(station) = station {
+            desk.controlling
+                .insert(job.job_id.clone(), (station.clone(), Control::Interrupt));
+            desk.controls.push((station, job));
+            drop(desk);
+            self.ready.notify_waiters();
+        }
+        Ok(true)
+    }
+
+    /// Counts one tool call of the conversation; `false` past the minute's allowance.
+    pub(crate) fn count_call(&self, conversation_id: &str) -> bool {
+        let mut desk = self.desk();
+        let limit = self.config.gateway.tool_calls_per_minute;
+        // The minute of `tool_calls_per_minute`.
+        desk.calls
+            .retain(|_, (started, _)| started.elapsed() < Duration::from_secs(60));
+        let (_, calls) = desk
+            .calls
+            .entry(conversation_id.to_owned())
+            .or_insert_with(|| (Instant::now(), 0));
+        *calls += 1;
+        limit.allows(*calls)
+    }
+}
+
+/// Records `action` by `person` in the audit log; `Err` says that nothing may run.
+async fn audit(
+    gateway: &Gateway,
+    person: &ai6::Person,
+    action: &str,
+    operation: String,
+    resource: Option<String>,
+    target: &str,
+) -> Result<(), String> {
+    let registry = gateway
+        .registry
+        .clone()
+        .ok_or("this gateway keeps no audit log, so it ran nothing")?;
+    let record = ai6::AuditRecord {
+        id: Uuid::new_v4().to_string(),
+        actor: person.id.clone(),
+        action: action.to_owned(),
+        operation,
+        resource,
+        target: cut(target, gateway_limits(gateway).audit_target_bytes.or_max()),
+        at: now(),
+    };
+    tokio::task::spawn_blocking(move || registry.record_audit(&record))
+        .await
+        .map_err(|_| "it could not be audited, so it did not run".to_owned())?
+        .map_err(|_| "it could not be audited, so it did not run".to_owned())
+}
+
+/// Adds `proposal` to `conversation`, after expired ones are marked and room is made, and
+/// shows it.
+fn record_proposal(
+    conversation: &mut Conversation,
+    mut proposal: actions::Proposal,
+    bounds: Bounds,
+    limits: &AssistantGatewayLimits,
+) -> bool {
+    if !room_for_proposal(conversation, limits) {
+        return false;
+    }
+    proposal.evidence = conversation.evidence();
+    conversation.push(
+        Entry {
+            role: Role::Proposal,
+            text: proposal.draft.summary.clone(),
+            at: proposal.created_at,
+            data: Some(proposal.shown()),
+        },
+        bounds,
+    );
+    conversation.proposals.push(proposal);
+    true
+}
+
+/// What she is told when a proposal does not fit.
+fn proposals_full(limits: &AssistantGatewayLimits) -> String {
+    format!(
+        "{} proposals already wait for the person, so nothing was proposed. Ask them to \
+         confirm or cancel some first.",
+        limits.proposals
+    )
+}
+
+/// Drops finished proposals until one more fits; `false` when every one kept still waits for
+/// the person or is being carried out, which are never dropped.
+fn room_for_proposal(conversation: &mut Conversation, limits: &AssistantGatewayLimits) -> bool {
+    expire_proposals(conversation, limits);
+    while !limits.proposals.allows(conversation.proposals.len() + 1) {
+        let Some(finished) = conversation
+            .proposals
+            .iter()
+            .position(|proposal| !matches!(proposal.status, "pending" | "confirming"))
+        else {
+            return false;
+        };
+        conversation.proposals.remove(finished);
+    }
+    true
+}
+
+/// A proposal whose confirmation has a Station make `commit`: `request` describes the commit
+/// for the person (its message, every file's new text), `needs` what it rests on.
+fn commit_proposal(
+    tool: &'static str,
+    session: String,
+    target: String,
+    scope: actions::Scope,
+    needs: &'static str,
+    summary: String,
+    commit: AssistantCommit,
+) -> actions::Proposal {
+    actions::Proposal {
+        id: format!("proposal-{}", Uuid::new_v4().simple()),
+        tool,
+        draft: actions::Draft {
+            call: tools::Call {
+                method: axum::http::Method::from_bytes(b"COMMIT")
+                    .unwrap_or(axum::http::Method::POST),
+                path: target,
+                body: Some(json!({
+                    "message": commit.message,
+                    "files": commit.change.files,
+                })),
+            },
+            scope,
+            action: needs,
+            summary,
+        },
+        status: "pending",
+        created_at: now(),
+        session,
+        result: None,
+        work: Some(commit),
+        cable: None,
+        evidence: actions::Evidence::default(),
+    }
+}
+
+/// Who a valid MCP token speaks for.
+pub(crate) struct Granted {
+    pub(crate) conversation_id: String,
+    pub(crate) person_id: String,
+    /// The person's access token, with which the tools run.
+    pub(crate) bearer: String,
+}
+
+/// Marks proposals older than `[assistant.gateway] proposal_ttl` expired.
+fn expire_proposals(conversation: &mut Conversation, limits: &AssistantGatewayLimits) {
+    let now = now();
+    let ttl = limits.proposal_ttl.0.as_secs_f64();
+    let mut expired = Vec::new();
+    for proposal in &mut conversation.proposals {
+        if proposal.status == "pending" && now - proposal.created_at > ttl {
+            proposal.status = "expired";
+            expired.push(proposal.clone());
+        }
+    }
+    for proposal in expired {
+        conversation.show_proposal(&proposal);
+    }
+}
+
+/// What the app is shown when it opens a conversation.
+///
+/// Only the newest entries that fit `[assistant.gateway] ready_entries` and `ready_bytes` are
+/// sent; `earlier` counts those left out. `view_limits` are the bounds the app checks views
+/// against.
+fn ready(
+    conversation: &Conversation,
+    limits: &views::ViewLimits,
+    gateway: &AssistantGatewayLimits,
+) -> Value {
+    let mut shown = Vec::new();
+    let mut bytes = 0;
+    for entry in conversation
+        .entries
+        .iter()
+        .rev()
+        .take(gateway.ready_entries.or_max())
+    {
+        bytes += store::entry_bytes(entry);
+        if !gateway.ready_bytes.allows(bytes) && !shown.is_empty() {
+            break;
+        }
+        shown.push(entry);
+    }
+    shown.reverse();
+    json!({
+        "type": "ready",
+        "conversation": conversation.id,
+        "entries": shown,
+        "earlier": conversation.entries.len() - shown.len(),
+        "busy": conversation.busy,
+        "view_limits": limits,
+    })
+}
+
+/// The end of the conversation so far, for a harness that starts without its provider
+/// Session's own memory of it: at most `[assistant.gateway] recap_bytes`, and under half of
+/// `[assistant.limits] context_bytes`, the rest being her standing context.
+fn recap(conversation: &Conversation, config: &AssistantConfig) -> Option<String> {
+    let mut lines = Vec::new();
+    let mut size = 0;
+    for entry in conversation.entries.iter().rev() {
+        let who = match entry.role {
+            Role::Person => "The person",
+            Role::Moneypenny => "You",
+            _ => continue,
+        };
+        let line = format!("{who}: {}", entry.text);
+        size += line.len();
+        if !config.gateway.recap_bytes.allows(size) {
+            break;
+        }
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    lines.reverse();
+    let recap = format!(
+        "Earlier in this conversation (a recap; the app restarted your session):\n\n{}",
+        lines.join("\n\n")
+    );
+    let half = config
+        .limits
+        .context_bytes
+        .get()
+        .map_or(u64::MAX, |bytes| bytes / 2);
+    (u64::try_from(recap.len()).unwrap_or(u64::MAX) < half).then_some(recap)
+}
+
+/// The line that tells Moneypenny which app page the person was on when they sent a message:
+/// the route in its link form, percent-encoded, or nothing when it is not a route.
+fn page_line(route: &Value, limits: routes::Limits) -> Option<String> {
+    let route = routes::Route::from_json(route, limits).ok()?;
+    Some(format!("[App page: {}]", route.to_uri()))
+}
+
+/// The input of `navigate`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Navigate {
+    to: Value,
+    label: String,
+}
+
+/// The route and label of a `navigate` input: exactly `{"to": ROUTE, "label": TEXT}`, the
+/// route valid within `config`'s route limits and the label within `navigate_label_bytes`.
+fn navigation(input: &Value, config: &AssistantConfig) -> Result<(routes::Route, String), String> {
+    let navigate: Navigate = serde_json::from_value(input.clone())
+        .map_err(|_| "navigate takes exactly {\"to\": {\"page\": ...}, \"label\": \"...\"}")?;
+    let route = routes::Route::from_json(&navigate.to, config.route_limits())?;
+    if navigate.label.trim().is_empty() {
+        return Err("the label is empty".to_owned());
+    }
+    checks::short_within(
+        "the label",
+        &navigate.label,
+        config.views.navigate_label_bytes,
+    )?;
+    Ok((route, navigate.label))
+}
+
+fn cut(text: &str, limit: usize) -> String {
+    let mut end = text.len().min(limit);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
+/// Records one harness event in the conversation.
+fn apply(conversation: &mut Conversation, event: &AssistantEvent, max_entries: Bounds) {
+    let at = now();
+    let text = event.text.clone().unwrap_or_default();
+    let entry = |role, text: String| Entry {
+        role,
+        text,
+        at,
+        data: None,
+    };
+    match event.kind.as_str() {
+        EVENT_TEXT if !text.trim().is_empty() => {
+            conversation.answered = true;
+            conversation.push(entry(Role::Moneypenny, text), max_entries);
+        }
+        EVENT_TOOL => {
+            let tools = event.tools.join(", ");
+            conversation.push(entry(Role::Tools, tools), max_entries);
+        }
+        EVENT_COMPLETED => {
+            if !conversation.answered && !text.trim().is_empty() {
+                conversation.push(entry(Role::Moneypenny, text), max_entries);
+            }
+            conversation.answered = false;
+            conversation.set_busy(false);
+        }
+        EVENT_FAILED | EVENT_LIMIT => {
+            let what = if event.kind == EVENT_LIMIT {
+                "Moneypenny's model account is out of quota for now".to_owned()
+            } else {
+                format!("Moneypenny stopped: {}", or_unknown(&text))
+            };
+            conversation.live = false;
+            conversation.push(entry(Role::Error, what), max_entries);
+            conversation.set_busy(false);
+        }
+        // What she and the person should know about her workspace.
+        EVENT_NOTICE if !text.trim().is_empty() => {
+            conversation.notes.push(format!("[Station: {text}]"));
+            conversation.push(entry(Role::Notice, text), max_entries);
+        }
+        // Only the answer being given can be the one stopped; a later message is not.
+        EVENT_INTERRUPTED if conversation.busy && conversation.pending.is_none() => {
+            stopped(conversation, max_entries);
+        }
+        EVENT_CLOSED if !conversation.busy || conversation.pending.is_some() => {
+            // An idle harness closed, or the one a new job replaces.
+            conversation.live = false;
+        }
+        EVENT_CLOSED => {
+            conversation.live = false;
+            conversation.push(
+                entry(
+                    Role::Error,
+                    format!(
+                        "Moneypenny's session closed before she answered: {}",
+                        or_unknown(&text)
+                    ),
+                ),
+                max_entries,
+            );
+            conversation.set_busy(false);
+        }
+        _ => {}
+    }
+}
+
+/// Records a Station's answer to a commit job: an entry for the person, then the proposal it
+/// carried out settled, or a note telling Moneypenny with her next message.
+fn committed(
+    conversation: &mut Conversation,
+    proposal: Option<&str>,
+    what: &str,
+    report: &AssistantReport,
+    bounds: Bounds,
+) {
+    let answer = report.events.first();
+    let done = answer.is_some_and(|event| event.kind == EVENT_ACCEPTED);
+    let text = answer
+        .and_then(|event| event.text.clone())
+        .unwrap_or_default();
+    let line = if done {
+        format!("{what}: {}.", or_unknown(&text))
+    } else {
+        format!("{what} failed: {}.", or_unknown(&text))
+    };
+    conversation.push(
+        Entry {
+            role: if done { Role::Notice } else { Role::Error },
+            text: line.clone(),
+            at: now(),
+            data: None,
+        },
+        bounds,
+    );
+    match proposal {
+        Some(id) => settle(conversation, id, done, or_unknown(&text)),
+        None => conversation.notes.push(format!("[Station: {line}]")),
+    }
+}
+
+/// Ends the answer the person stopped, and shows that it was stopped.
+fn stopped(conversation: &mut Conversation, bounds: Bounds) {
+    conversation.pending = None;
+    conversation.answered = false;
+    conversation.push(
+        Entry {
+            role: Role::Notice,
+            text: "You stopped Moneypenny's answer.".to_owned(),
+            at: now(),
+            data: None,
+        },
+        bounds,
+    );
+    conversation.set_busy(false);
+}
+
+fn or_unknown(text: &str) -> &str {
+    if text.trim().is_empty() {
+        "no reason given"
+    } else {
+        text
+    }
+}
+
+/// Healthy Stations, the Headquarters Station first, then by ID.
+async fn healthy_stations(gateway: &Gateway) -> Vec<String> {
+    let Some(registry) = gateway.registry.clone() else {
+        return Vec::new();
+    };
+    let found = tokio::task::spawn_blocking(move || {
+        let stations = registry.stations(Duration::MAX).ok()?;
+        let headquarters = registry.headquarters().ok().flatten();
+        let dark = registry.limits().stations.gone_dark_after.0.as_secs_f64();
+        Some((stations, headquarters, dark))
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some((stations, headquarters, dark)) = found else {
+        return Vec::new();
+    };
+    let now = now();
+    let leader = headquarters
+        .filter(|lease| lease.expires() > now)
+        .map(|lease| lease.station().to_owned());
+    let mut healthy: Vec<String> = stations
+        .iter()
+        .filter(|station| now - station.seen() <= dark)
+        .map(|station| station.station().to_owned())
+        .collect();
+    healthy.sort_by_key(|station| (Some(station) != leader.as_ref(), station.clone()));
+    healthy
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum FromApp {
+    Hello {
+        token: String,
+        #[serde(default)]
+        conversation: Option<String>,
+    },
+    Message {
+        text: String,
+        #[serde(default)]
+        route: Option<Value>,
+        #[serde(default)]
+        images: Vec<images::AppImage>,
+    },
+    New {},
+    Confirm {
+        proposal: String,
+    },
+    Cancel {
+        proposal: String,
+    },
+    Submit {
+        view: String,
+        values: serde_json::Map<String, Value>,
+    },
+    Interrupt {},
+}
+
+fn frame(value: &Value) -> Message {
+    Message::Text(value.to_string().into())
+}
+
+fn problem(code: &str, message: &str) -> Value {
+    json!({"type": "error", "code": code, "message": message})
+}
+
+/// `GET /v1/user/moneypenny`: the app's conversation with Moneypenny. The first frame is
+/// `{"type":"hello","token":ACCESS_TOKEN,"conversation"?:ID}`; the token is the person's
+/// access token, sent in the socket rather than a header a browser cannot set.
+pub(crate) async fn socket(State(gateway): State<Gateway>, upgrade: WebSocketUpgrade) -> Response {
+    if gateway.assistant.is_none() {
+        return ApiError::unavailable().into_response();
+    }
+    // A message frame carries its images as base64, four characters for three bytes.
+    let images = gateway.assistant.as_ref().map_or(0, |assistant| {
+        let limits = &assistant.config.limits;
+        limits
+            .images
+            .or_max()
+            .saturating_mul(limits.image_bytes.or_max().div_ceil(3).saturating_mul(4))
+    });
+    let most = gateway_limits(&gateway)
+        .socket_message_bytes
+        .or_max()
+        .saturating_add(images);
+    upgrade
+        .max_message_size(most)
+        .on_upgrade(move |socket| converse(socket, gateway))
+}
+
+async fn converse(socket: WebSocket, gateway: Gateway) {
+    let Some(assistant) = gateway.assistant.clone() else {
+        return;
+    };
+    let (mut sender, mut receiver) = socket.split();
+    let hello =
+        tokio::time::timeout(assistant.config.gateway.hello_timeout.0, receiver.next()).await;
+    let Ok(Some(Ok(Message::Text(hello)))) = hello else {
+        let _ = sender.send(close(1008, "say hello first")).await;
+        return;
+    };
+    let Ok(FromApp::Hello {
+        token,
+        conversation,
+    }) = serde_json::from_str::<FromApp>(&hello)
+    else {
+        let _ = sender.send(close(1008, "say hello first")).await;
+        return;
+    };
+    let Ok(person) = resolve_user(&gateway, &token).await else {
+        let _ = sender
+            .send(frame(&problem(
+                "unauthorized",
+                "Sign in again to talk to Moneypenny.",
+            )))
+            .await;
+        let _ = sender.send(close(1008, "unauthorized")).await;
+        return;
+    };
+    if let Some(requested) = conversation.as_deref() {
+        assistant
+            .restore(&gateway, &person.id, &token, requested)
+            .await;
+    }
+    let (mut conversation_id, shown, mut events) =
+        assistant.open(&person.id, &token, conversation.as_deref());
+    if sender.send(frame(&shown)).await.is_err() {
+        return;
+    }
+    let mut sweep = tokio::time::interval(assistant.config.gateway.sweep_every.0);
+    loop {
+        tokio::select! {
+            _ = sweep.tick() => assistant.sweep(&gateway).await,
+            incoming = receiver.next() => match incoming {
+                Some(Ok(Message::Text(text))) => {
+                    match serde_json::from_str::<FromApp>(&text) {
+                        Ok(FromApp::Message { text, route, images }) => {
+                            if let Err((code, message)) = assistant
+                                .message(&gateway, &conversation_id, &person.id, &text, route.as_ref(), &images)
+                                .await
+                                && sender.send(frame(&problem(code, &message))).await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Ok(FromApp::Confirm { proposal }) => {
+                            if let Err((code, message)) = assistant
+                                .confirm(&gateway, &conversation_id, &person, &token, &proposal)
+                                .await
+                                && sender.send(frame(&problem(code, &message))).await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Ok(FromApp::Cancel { proposal }) => {
+                            if let Err((code, message)) =
+                                assistant.cancel(&conversation_id, &person.id, &proposal)
+                                && sender.send(frame(&problem(code, &message))).await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Ok(FromApp::Submit { view, values }) => {
+                            if let Err((code, message)) = assistant
+                                .submit(&gateway, &conversation_id, &person.id, &token, &view, &values)
+                                .await
+                                && sender.send(frame(&problem(code, &message))).await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Ok(FromApp::Interrupt {}) => {
+                            let answer = match assistant.interrupt(&conversation_id, &person.id) {
+                                Ok(stopping) => json!({"type": "interrupt", "stopping": stopping}),
+                                Err((code, message)) => problem(code, &message),
+                            };
+                            if sender.send(frame(&answer)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(FromApp::New {}) => {
+                            let (id, shown, subscription) = assistant.open(&person.id, &token, None);
+                            conversation_id = id;
+                            events = subscription;
+                            if sender.send(frame(&shown)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(FromApp::Hello { .. }) | Err(_) => {
+                            if sender
+                                .send(frame(&problem("bad_request", "That frame is not understood.")))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Some(Ok(Message::Ping(payload))) => {
+                    if sender.send(Message::Pong(payload)).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(Message::Pong(_))) => {}
+                Some(Ok(Message::Binary(_))) => {
+                    let _ = sender.send(close(1003, "text frames only")).await;
+                    break;
+                }
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+            },
+            event = events.recv() => match event {
+                Ok(event) => {
+                    if sender.send(frame(&event)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    let _ = sender.send(close(1013, "fell behind; reopen the conversation")).await;
+                    break;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+        }
+    }
+}
+
+fn close(code: u16, reason: &'static str) -> Message {
+    Message::Close(Some(CloseFrame {
+        code,
+        reason: reason.into(),
+    }))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct NextQuery {
+    station: String,
+    wait_ms: Option<u64>,
+}
+
+/// `GET /v1/station/assistant/next?station=ID&wait_ms=N`: the next message for the
+/// Station's assistant desk (`200` and an [`AssistantJob`]), or `204` after `wait_ms`
+/// (default 1,000, at most `[assistant.gateway] max_wait`).
+pub(crate) async fn next(
+    State(gateway): State<Gateway>,
+    headers: HeaderMap,
+    Query(query): Query<NextQuery>,
+) -> Result<Response, ApiError> {
+    gateway.authenticate_station(bearer(&headers)?)?;
+    if !ai6::directorates::section_00::assistant::valid_identity(&query.station) {
+        return Err(ApiError::bad_request());
+    }
+    // With Moneypenny off the poll is still held, so an idle Station does not ask in a loop.
+    let max_wait = gateway
+        .assistant
+        .as_ref()
+        .map_or(gateway.job_poll_max_wait, |assistant| {
+            assistant.config.gateway.max_wait.0
+        });
+    let wait = Duration::from_millis(query.wait_ms.unwrap_or(1_000)).min(max_wait);
+    let Some(assistant) = gateway.assistant.clone() else {
+        tokio::time::sleep(wait).await;
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    };
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let notified = assistant.ready.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if let Some(job) = assistant.take(&gateway, &query.station).await {
+            return Ok(Json(job).into_response());
+        }
+        if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            return Ok(StatusCode::NO_CONTENT.into_response());
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct StandingQuery {
+    station: String,
+    conversation: String,
+    /// The Operation whose Cable permissions the Station asks about.
+    operation: String,
+}
+
+/// `GET /v1/station/assistant/cables?station=ID&conversation=ID&operation=ID`: `"send"` and
+/// `"read"`, whether the person of a conversation the Station runs holds `cable.send` and
+/// `cable.read` on the Operation now; `404` for one this gateway does not hold, `403` for one
+/// another Station runs.
+pub(crate) async fn cable_standing(
+    State(gateway): State<Gateway>,
+    headers: HeaderMap,
+    Query(query): Query<StandingQuery>,
+) -> Result<Json<Value>, ApiError> {
+    gateway.authenticate_station(bearer(&headers)?)?;
+    let assistant = gateway.assistant.clone().ok_or_else(ApiError::not_found)?;
+    assistant.run_by(&query.station, &query.conversation)?;
+    // A harness cut off by a Stop sends and reads no Cable.
+    let cut_off = assistant
+        .desk()
+        .store
+        .conversations
+        .get(&query.conversation)
+        .is_some_and(|conversation| {
+            conversation.cut_off.as_deref() == Some(query.station.as_str())
+        });
+    let (send, read) = if cut_off {
+        (false, false)
+    } else {
+        assistant
+            .cable_permissions(&gateway, &query.conversation, &query.operation)
+            .await
+    };
+    Ok(Json(json!({"send": send, "read": read})))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ImageQuery {
+    station: String,
+    conversation: String,
+}
+
+/// An image as a response: its own format, nothing to run, kept nowhere on the way.
+fn image_response(media_type: &'static str, bytes: Vec<u8>) -> Response {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, media_type),
+            (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (axum::http::header::CACHE_CONTROL, "no-store, private"),
+            (
+                axum::http::header::CONTENT_SECURITY_POLICY,
+                "sandbox; default-src 'none'",
+            ),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+/// `GET /v1/station/assistant/images/{sha256}?station=&conversation=`: an image the person of a
+/// conversation the Station runs, or took a job of, sent; `404` for one this gateway does not
+/// keep for them, `403` for a conversation another Station runs.
+pub(crate) async fn station_image(
+    State(gateway): State<Gateway>,
+    headers: HeaderMap,
+    Path(sha256): Path<String>,
+    Query(query): Query<ImageQuery>,
+) -> Result<Response, ApiError> {
+    gateway.authenticate_station(bearer(&headers)?)?;
+    let assistant = gateway.assistant.clone().ok_or_else(ApiError::not_found)?;
+    // The Station reads a message's images before its harness accepts the message, so the one
+    // that took the job may read them as well as the one that runs the conversation.
+    let person = {
+        let desk = assistant.desk();
+        let conversation = desk
+            .store
+            .conversations
+            .get(&query.conversation)
+            .ok_or_else(ApiError::not_found)?;
+        let taken_by = conversation
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.station.as_deref());
+        if conversation.station.as_deref() != Some(query.station.as_str())
+            && taken_by != Some(query.station.as_str())
+        {
+            return Err(ApiError::forbidden());
+        }
+        conversation.person_id.clone()
+    };
+    let store = gateway.images.clone().ok_or_else(ApiError::not_found)?;
+    let (media_type, bytes) = store
+        .get(&person, &sha256)
+        .ok_or_else(ApiError::not_found)?;
+    Ok(image_response(media_type, bytes))
+}
+
+/// `GET /v1/user/moneypenny/images/{sha256}`: an image the person sent her; `404` for any other.
+pub(crate) async fn user_image(
+    State(gateway): State<Gateway>,
+    headers: HeaderMap,
+    Path(sha256): Path<String>,
+) -> Result<Response, ApiError> {
+    let person = resolve_user(&gateway, bearer(&headers)?).await?;
+    let store = gateway.images.clone().ok_or_else(ApiError::not_found)?;
+    let (media_type, bytes) = store
+        .get(&person.id, &sha256)
+        .ok_or_else(ApiError::not_found)?;
+    Ok(image_response(media_type, bytes))
+}
+
+/// `POST /v1/station/assistant/reports`: what a Station's assistant harness did. `204`;
+/// `404` for a conversation this gateway does not hold, `409` for a job it no longer waits
+/// for, `403` for a report from a Station that does not run the conversation.
+pub(crate) async fn reports(
+    State(gateway): State<Gateway>,
+    headers: HeaderMap,
+    Json(report): Json<AssistantReport>,
+) -> Result<StatusCode, ApiError> {
+    gateway.authenticate_station(bearer(&headers)?)?;
+    let Some(assistant) = gateway.assistant.clone() else {
+        return Err(ApiError::not_found());
+    };
+    match assistant.report(&gateway, report).await {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(StatusCode::NOT_FOUND) => Err(ApiError::not_found()),
+        Err(StatusCode::FORBIDDEN) => Err(ApiError::forbidden()),
+        Err(StatusCode::CONFLICT) => Err(ApiError::from(GatewayError::Conflict)),
+        Err(_) => Err(ApiError::bad_request()),
+    }
+}
+
+#[cfg(test)]
+mod tests;

@@ -1,0 +1,209 @@
+name: Test
+
+# On demand: workflow_dispatch (optionally at a ref), or a pushed "ci-*" tag, which is
+# throwaway and deleted after its run. Not run on every push.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to test (branch, tag, or SHA)"
+        required: false
+        default: ""
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git ref to test (branch, tag, or SHA)"
+        type: string
+        required: false
+        default: ""
+  push:
+    tags:
+      - "ci-*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-api:
+    name: Rust public API snapshots
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-09-21
+      - name: Install cargo-public-api
+        run: cargo +stable install cargo-public-api --version 0.52.0 --locked
+      - name: Compare crate API snapshots
+        shell: pwsh
+        run: ./tools/public-api.ps1
+
+  rust:
+    name: Rust (${{ matrix.os }}, Rust ${{ matrix.toolchain }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        toolchain: [stable, "1.89"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+        if: matrix.toolchain == 'stable'
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # Provider crates build ai6 without its features; keep that build warning-free too.
+      - run: cargo clippy -p ai6 --no-default-features -- -D warnings
+      # PostgreSQL for the SQL Registry tests: a plaintext server for the suite, and a
+      # TLS-only one whose certificate a throwaway CA signs. Linux runners only (a job-level
+      # service would also start on the Windows and macOS legs, which cannot run one); the
+      # other legs skip those tests and print how many.
+      - name: Start PostgreSQL
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tls="$RUNNER_TEMP/postgres-tls"
+          mkdir -p "$tls"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=ai6 CI CA" \
+            -keyout "$tls/ca.key" -out "$tls/ca.pem" \
+            -addext "basicConstraints=critical,CA:TRUE" \
+            -addext "keyUsage=critical,keyCertSign,cRLSign"
+          openssl req -newkey rsa:2048 -nodes -subj "/CN=localhost" \
+            -keyout "$tls/server.key" -out "$tls/server.csr"
+          printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n' > "$tls/ext.cnf"
+          openssl x509 -req -in "$tls/server.csr" -CA "$tls/ca.pem" -CAkey "$tls/ca.key" \
+            -CAcreateserial -days 1 -out "$tls/server.pem" -extfile "$tls/ext.cnf"
+          printf 'local all all trust\nhostssl all all 0.0.0.0/0 scram-sha-256\nhostssl all all ::/0 scram-sha-256\n' > "$tls/pg_hba.conf"
+          sudo chown 999:999 "$tls/server.key" "$tls/server.pem" "$tls/pg_hba.conf"
+          sudo chmod 600 "$tls/server.key"
+          # The image tools/sdk/sdk.lock names.
+          image=postgres:17@sha256:3b0cda93be7c8dba2ed484d19393d93845dc3dafb88973e248ba8e6d99d784e1
+          docker run -d --name postgres -e POSTGRES_PASSWORD=ci -p 5432:5432 "$image"
+          docker run -d --name postgres-tls -e POSTGRES_PASSWORD=ci -p 5433:5432 \
+            -v "$tls:/tls" "$image" -c ssl=on -c ssl_cert_file=/tls/server.pem \
+            -c ssl_key_file=/tls/server.key -c hba_file=/tls/pg_hba.conf
+          for container in postgres postgres-tls; do
+            for _ in $(seq 1 90); do
+              docker exec "$container" pg_isready -U postgres -h 127.0.0.1 && break
+              sleep 1
+            done
+            docker exec "$container" pg_isready -U postgres -h 127.0.0.1
+          done
+          echo "AI6_TEST_POSTGRES_URL=postgres://postgres:ci@localhost:5432/postgres?sslmode=disable" >> "$GITHUB_ENV"
+          echo "AI6_TEST_POSTGRES_TLS_URL=postgres://postgres:ci@localhost:5433/postgres?sslrootcert=$tls/ca.pem" >> "$GITHUB_ENV"
+      - run: cargo test --workspace --all-features
+      - run: cargo run -p ai6 --features cli --example settings_reference -- --check
+      - run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo check -p ai6-diptel --target wasm32-unknown-unknown
+        if: matrix.os == 'ubuntu-latest' && matrix.toolchain == 'stable'
+
+  outer-office:
+    name: Outer Office app (Windows, locked Flutter)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: clients/outer-office
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: ./.github/actions/sdk
+      - run: flutter config --enable-windowing
+      - run: flutter pub get --offline
+      - run: dart run tool/build_guatiao_wasm.dart
+      - run: dart format --output=none --set-exit-if-changed lib test
+      - run: flutter analyze --fatal-infos
+      # Before the tests, so the no-CDN check reads a real build/web.
+      - run: flutter build web --release
+      # The Noto fallback fonts the build serves itself, checked against tool/cdn_files.json.
+      - run: dart run tool/cdn_files.dart fill --deps "$env:AI6_SDK_DEPS"
+      - run: flutter test
+      - run: flutter build windows --debug
+
+  outer-office-linux:
+    name: Outer Office app (Linux, locked Flutter)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/outer-office
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - name: Install the system group
+        working-directory: .
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev unzip
+      - uses: ./.github/actions/sdk
+      - run: flutter pub get --offline
+      - run: flutter build linux --debug
+
+  # A person's first command, on every platform Rust builds on.
+  bootstrap:
+    name: Bootstrap (${{ matrix.platform }})
+    if: startsWith(github.ref, 'refs/tags/ci-')
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux-x64, os: ubuntu-latest }
+          - { platform: linux-arm64, os: ubuntu-24.04-arm }
+          - { platform: windows-x64, os: windows-latest }
+          - { platform: windows-arm64, os: windows-11-arm }
+          - { platform: macos-arm64, os: macos-latest }
+          - { platform: macos-x64, os: macos-15-intel }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - name: Install the system group
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev unzip
+      - uses: ./.github/actions/sdk
+      # --check exits 1 on anything still missing, and fetches nothing.
+      - name: A second run has nothing to do
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./tools/sdk/bootstrap.ps1 --check --prefix "$env:AI6_SDK_HOME"
+      - name: A second run has nothing to do
+        if: runner.os != 'Windows'
+        run: sh tools/sdk/bootstrap.sh --check --prefix "$AI6_SDK_HOME"
+      - name: The lock against the repository and upstream
+        if: matrix.platform == 'linux-x64'
+        run: |
+          git fetch --depth 1 origin "$(awk '$1 == "app" && $2 == "deps" { print $3 }' tools/sdk/sdk.lock)"
+          git fetch --depth 1 origin deps:refs/remotes/origin/deps
+          python3 tools/sdk/check_lock.py --online
+      - run: cargo --version
+      - run: flutter --version
+      - run: cargo check -p ai6-diptel
+      - run: flutter pub get --offline
+        working-directory: clients/outer-office
+      - run: flutter analyze --fatal-infos
+        working-directory: clients/outer-office

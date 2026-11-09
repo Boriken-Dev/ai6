@@ -1,0 +1,1587 @@
+import 'dart:convert';
+import 'dart:ui' show Size;
+
+import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
+import 'package:material_ui/material_ui.dart'
+    show FilledButton, Key, ScaffoldMessenger, Tab, SwitchListTile, TextField;
+import 'package:outer_office/main.dart';
+
+import 'shell_navigation.dart';
+
+String stationBoardResponse() => jsonEncode({
+  'headquarters_station': 'station-alpha',
+  'stations': [
+    {
+      'station_id': 'station-alpha',
+      'healthy': true,
+      'headquarters': true,
+      'seen': 1000,
+      'roles': ['control', 'execution'],
+      'running': 2,
+      'capacity': 4,
+      'operations': ['operation-alpha'],
+      'head_of_station': {
+        'station': 'station-alpha',
+        'at': 1000,
+        'summary': 'Disk at 12% free; two safe houses hold 40 GB of caches.',
+        'findings': [
+          {
+            'kind': 'disk',
+            'severity': 'warning',
+            'text': '12% free under the state directory',
+          },
+          {
+            'kind': 'safe-house',
+            'severity': 'critical',
+            'text': 'mission-9 holds unexported commits',
+          },
+        ],
+        'mission': 'round-1',
+        'agent': 'M',
+      },
+      'resources': {
+        'cpus': 8.0,
+        'cpu_percent': 25.0,
+        'load_1m': 1.5,
+        'memory_total_mb': 16384,
+        'memory_available_mb': 12288,
+        'sampled_at': 1000,
+      },
+      'theaters': [
+        {'id': 'local', 'access': 'local', 'labels': {}},
+        {
+          'id': 'build-box',
+          'access': 'ssh',
+          'host': 'build.example.net',
+          'labels': {'os': 'linux'},
+          'capabilities': {
+            'terminal': true,
+            'run': true,
+            'files': true,
+            'forward': false,
+            'os': 'linux',
+            'arch': 'x86_64',
+          },
+          'agents': 'remote-hands',
+          'egress': 'none',
+          'resources': {
+            'cpus': 1.5,
+            'load_1m': 0.5,
+            'memory_total_mb': 256,
+            'sampled_at': 1010,
+          },
+          'sessions': 1,
+        },
+        {
+          'id': 'lab',
+          'access': 'local',
+          'labels': {},
+          'requires': {
+            'harnesses': ['claude>=2.1'],
+            'tools': ['git'],
+          },
+          'report': {
+            'checked_at': 1000,
+            'found': {'git': 'git version 2.47.0'},
+            'unmet': [
+              {
+                'name': 'claude',
+                'requirement': 'claude>=2.1',
+                'reason': 'not installed',
+              },
+            ],
+          },
+          'weakened': [
+            'ambient credential on the Theater: an SSH agent (SSH_AUTH_SOCK)',
+          ],
+        },
+        {
+          'id': 'scratch',
+          'access': 'ephemeral',
+          'provider': 'ephemeral-container',
+          'labels': {},
+          'agents': 'remote-hands',
+        },
+        {
+          'id': 'scratch-mission-007',
+          'access': 'transport',
+          'provider': 'container',
+          'labels': {},
+          'agents': 'remote-hands',
+          'made_for': 'mission-007',
+        },
+      ],
+    },
+  ],
+});
+
+String userProfileResponse({
+  String operationId = 'operation-alpha',
+  List<String> actions = const [
+    'mission.read',
+    'mission.create',
+    'session.read',
+  ],
+  List<Map<String, Object>> stations = const [],
+}) => jsonEncode({
+  'person_id': 'operator-007',
+  'name': 'operator',
+  'display_name': 'Operator 007',
+  'groups': ['field'],
+  'expires_at': 1_900_000_000,
+  'operations': [
+    {'operation_id': operationId, 'actions': actions},
+  ],
+  'stations': stations,
+});
+
+void main() {
+  test('a brief origin says who asked for the Mission', () {
+    BriefOrigin origin(Map<String, dynamic> json) =>
+        BriefOrigin.fromJson({'received_by': 'universal-exports', ...json});
+    expect(
+      origin({'origin': 'operator', 'principal': 'person-m'}).describe(),
+      'Operator person-m via universal-exports',
+    );
+    final source = origin({
+      'origin': 'source',
+      'principal': 'github',
+      'reference': 'owner/repo#12',
+      'item_url': 'https://example.invalid/12',
+    });
+    expect(source.describe(), 'Source github item owner/repo#12');
+    expect(source.itemUrl, 'https://example.invalid/12');
+    expect(
+      origin({'origin': 'proposal', 'principal': '007'}).describe(),
+      'Proposal by Agent 007, approved via universal-exports',
+    );
+    expect(
+      origin({'origin': 'review', 'received_by': 'hq'}).describe(),
+      'Chief of Staff review queued by hq',
+    );
+    expect(origin({'origin': 'registry_drop'}).isRegistryDrop, isTrue);
+    final brief = MissionBriefSummary.fromMissionJson({
+      'operation_id': 'G',
+      'mission_id': 'm',
+      'brief': {
+        'prompt': 'p',
+        'handler_provider': 'claude',
+        'terminal_provider': 'pty',
+        'working_directory': '/w',
+        'environment_keys': <String>[],
+      },
+    });
+    expect(brief!.origin, isNull, reason: 'a Station-started Mission has none');
+  });
+
+  testWidgets('demo board explains that sign-in is unavailable', (
+    tester,
+  ) async {
+    final board = MissionBoard(
+      apiOrigin: Uri.parse('https://oo.example'),
+      demo: true,
+      pollInterval: null,
+    );
+    addTearDown(board.dispose);
+    await tester.pumpWidget(
+      OuterOfficeApp(board: board, desktopWindows: false),
+    );
+    await openPage(tester, 'Missions');
+
+    expect(
+      find.text(
+        'Demo data: nothing here is connected, and changes are turned off.',
+      ),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('demo Agents page opens with sample Agent roles', (tester) async {
+    final board = MissionBoard(
+      apiOrigin: Uri.parse('https://oo.example'),
+      demo: true,
+      pollInterval: null,
+    );
+    addTearDown(board.dispose);
+    await tester.pumpWidget(
+      OuterOfficeApp(board: board, desktopWindows: false),
+    );
+    await openPage(tester, 'Agents');
+    await tester.tap(find.widgetWithText(Tab, 'Roles'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('case-officer'), findsOneWidget);
+    expect(find.textContaining('Follow the Operation policy.'), findsOneWidget);
+    expect(find.text('Add role'), findsNothing);
+  });
+
+  testWidgets(
+    'Mission proposal preview shows provenance and disables decisions',
+    (tester) async {
+      final board = MissionBoard(
+        apiOrigin: Uri.parse('https://oo.example'),
+        demo: true,
+        pollInterval: null,
+      );
+      addTearDown(board.dispose);
+      await tester.pumpWidget(
+        OuterOfficeApp(board: board, desktopWindows: false),
+      );
+      await openPage(tester, 'Briefings');
+      await tester.tap(find.text('Mission proposals'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Review the role catalog'), findsOneWidget);
+      expect(find.textContaining('coordinator-007'), findsOneWidget);
+      expect(find.textContaining('mission-007'), findsOneWidget);
+      expect(
+        find.textContaining('Demo data: decisions are off'),
+        findsOneWidget,
+      );
+      final approve = tester.widget<FilledButton>(
+        find.widgetWithText(FilledButton, 'Approve and queue'),
+      );
+      expect(approve.onPressed, isNull);
+    },
+  );
+
+  testWidgets('the rail hides pages the account has no access to', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(800, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final board = MissionBoard(
+      apiOrigin: Uri.parse('https://oo.example'),
+      pollInterval: null,
+    );
+    board.accessToken = 'user-token';
+    board.loading = false;
+    board.userSession = UserSessionSummary.fromJson(
+      jsonDecode(userProfileResponse(actions: ['mission.read', 'session.read']))
+          as Map<String, dynamic>,
+    );
+    addTearDown(board.dispose);
+
+    await tester.pumpWidget(
+      OuterOfficeApp(board: board, desktopWindows: false),
+    );
+
+    for (final page in ['Overview', 'Operations', 'Missions', 'Sessions']) {
+      expect(await offersPage(tester, page), isTrue, reason: page);
+    }
+    expect(await offersPage(tester, 'Stations'), isTrue);
+    for (final page in [
+      'Agents',
+      'Green Ink',
+      'Briefings',
+      'Roster',
+      'Account Pools',
+      'Timeline',
+      'Audit',
+    ]) {
+      expect(await offersPage(tester, page), isFalse, reason: page);
+    }
+  });
+
+  testWidgets('Station settings update through the authorized gateway API', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(800, 1600);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final requests = <http.Request>[];
+    final board = MissionBoard(
+      apiOrigin: Uri.parse('https://oo.example'),
+      pollInterval: null,
+      client: MockClient((request) async {
+        requests.add(request);
+        if (request.method == 'GET' && request.url.path.endsWith('/settings')) {
+          return http.Response(
+            jsonEncode({
+              'station_id': 'station-alpha',
+              'max_concurrent_missions': 4,
+              'min_free_memory_mb': 256,
+              'max_cpu_percent': 90,
+              'configured': false,
+              'execution_enabled': true,
+            }),
+            200,
+          );
+        }
+        if (request.method == 'PUT' && request.url.path.endsWith('/settings')) {
+          return http.Response('', 204);
+        }
+        return http.Response('[]', 200);
+      }),
+    );
+    board.accessToken = 'operator-token';
+    board.loading = false;
+    board.userSession = UserSessionSummary.fromJson(
+      jsonDecode(
+        userProfileResponse(
+          stations: [
+            {
+              'station_id': 'station-alpha',
+              'actions': ['station.read', 'station.configure'],
+            },
+          ],
+        ),
+      ) as Map<String, dynamic>,
+    );
+    addTearDown(board.dispose);
+
+    await tester.pumpWidget(
+      OuterOfficeApp(board: board, desktopWindows: false),
+    );
+    await openPage(tester, 'Stations');
+    await tester.tap(find.widgetWithText(Tab, 'Settings'));
+    await tester.pumpAndSettle();
+    expect(find.text('Maximum concurrent Missions'), findsOneWidget);
+    expect(find.textContaining('Current Station value.'), findsOneWidget);
+    expect(
+      tester
+          .widget<TextField>(find.byKey(const Key('station-min-free-memory')))
+          .controller!
+          .text,
+      '256',
+    );
+    expect(
+      tester
+          .widget<TextField>(find.byKey(const Key('station-max-cpu')))
+          .controller!
+          .text,
+      '90',
+    );
+
+    await tester.enterText(find.byKey(const Key('station-capacity')), '7');
+    await tester.enterText(
+      find.byKey(const Key('station-min-free-memory')),
+      '0',
+    );
+    await tester.enterText(find.byKey(const Key('station-max-cpu')), '100');
+    await tester.tap(find.text('Save settings'));
+    await tester.pumpAndSettle();
+
+    final update = requests.singleWhere((request) => request.method == 'PUT');
+    expect(update.url.path, '/v1/user/stations/station-alpha/settings');
+    expect(jsonDecode(update.body), {
+      'max_concurrent_missions': 7,
+      'min_free_memory_mb': 0,
+      'max_cpu_percent': 100,
+    });
+  });
+
+  testWidgets('Out-of-range resource limits show an error and send nothing', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(800, 1600);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final requests = <http.Request>[];
+    final board = MissionBoard(
+      apiOrigin: Uri.parse('https://oo.example'),
+      pollInterval: null,
+      client: MockClient((request) async {
+        requests.add(request);
+        if (request.method == 'GET' && request.url.path.endsWith('/settings')) {
+          return http.Response(
+            jsonEncode({
+              'station_id': 'station-alpha',
+              'max_concurrent_missions': 4,
+              'min_free_memory_mb': 512,
+              'max_cpu_percent': 95,
+              'configured': true,
+              'execution_enabled': true,
+            }),
+            200,
+          );
+        }
+        return http.Response('[]', 200);
+      }),
+    );
+    board.accessToken = 'operator-token';
+    board.loading = false;
+    board.userSession = UserSessionSummary.fromJson(
+      jsonDecode(
+        userProfileResponse(
+          stations: [
+            {
+              'station_id': 'station-alpha',
+              'actions': ['station.read', 'station.configure'],
+            },
+          ],
+        ),
+      ) as Map<String, dynamic>,
+    );
+    addTearDown(board.dispose);
+
+    await tester.pumpWidget(
+      OuterOfficeApp(board: board, desktopWindows: false),
+    );
+    await openPage(tester, 'Stations');
+    await tester.tap(find.widgetWithText(Tab, 'Settings'));
+    await tester.pumpAndSettle();
+
+    for (final (key, value, message) in [
+      ('station-max-cpu', '101', 'Maximum CPU must be a whole percent'),
+      ('station-max-cpu', 'lots', 'Maximum CPU must be a whole percent'),
+      ('station-min-free-memory', '-1', 'Minimum free memory must be'),
+    ]) {
+      await tester.enterText(
+        find.byKey(const Key('station-min-free-memory')),
+        '512',
+      );
+      await tester.enterText(find.byKey(const Key('station-max-cpu')), '95');
+      await tester.enterText(find.byKey(Key(key)), value);
+      await tester.tap(find.text('Save settings'));
+      await tester.pump();
+      expect(
+        find.textContaining(message),
+        findsOneWidget,
+        reason: '$key=$value',
+      );
+      ScaffoldMessenger.of(tester.element(find.text('Save settings')))
+          .removeCurrentSnackBar();
+      await tester.pumpAndSettle();
+    }
+    expect(requests.where((request) => request.method == 'PUT'), isEmpty);
+  });
+
+  test(
+    'proxy sign-in exchanges the authenticated reverse-proxy identity',
+    () async {
+      final requests = <http.Request>[];
+      final board = MissionBoard(
+        apiOrigin: Uri.parse('https://oo.example'),
+        pollInterval: null,
+        client: MockClient((request) async {
+          requests.add(request);
+          if (request.url.path == '/v1/auth/login') {
+            expect(jsonDecode(request.body), isEmpty);
+            return http.Response(
+              jsonEncode({'token': 'proxy-user-token'}),
+              201,
+            );
+          }
+          expect(request.headers['authorization'], 'Bearer proxy-user-token');
+          if (request.url.path == '/v1/missions') {
+            return http.Response('[]', 200);
+          }
+          if (request.url.path == '/v1/stations') {
+            return http.Response(stationBoardResponse(), 200);
+          }
+          if (request.url.path == '/v1/user/profile') {
+            return http.Response(userProfileResponse(), 200);
+          }
+          if (request.url.path ==
+              '/v1/user/operations/operation-alpha/held-briefs') {
+            return http.Response('[]', 200);
+          }
+          expect(request.url.path, '/v1/board');
+          return http.Response('[]', 200);
+        }),
+      );
+      addTearDown(board.dispose);
+
+      await board.loginViaProxy();
+
+      expect(board.accessToken, 'proxy-user-token');
+      expect(board.canCreateMission('operation-alpha'), isTrue);
+      expect(requests.map((request) => request.url.path), [
+        '/v1/auth/login',
+        '/v1/board',
+        '/v1/missions',
+        '/v1/stations',
+        '/v1/user/profile',
+        '/v1/user/operations/operation-alpha/held-briefs',
+        '/v1/user/operations/operation-alpha/mission-proposals',
+      ]);
+    },
+  );
+
+  test(
+    'proxy sign-in rejection explains the required organization proxy',
+    () async {
+      final board = MissionBoard(
+        apiOrigin: Uri.parse('http://127.0.0.1:7357'),
+        pollInterval: null,
+        client: MockClient((request) async {
+          expect(request.url.path, '/v1/auth/login');
+          expect(jsonDecode(request.body), isEmpty);
+          return http.Response('Not found', 404);
+        }),
+      );
+      addTearDown(board.dispose);
+
+      await board.loginViaProxy();
+
+      expect(board.accessToken, isNull);
+      expect(
+        board.loginError,
+        contains(
+          'Open Outer Office through your authenticated organization proxy',
+        ),
+      );
+      expect(board.loginError, isNot(contains('Check the account')));
+    },
+  );
+
+  test(
+    'Mission creation posts a bounded brief and refreshes the board',
+    () async {
+      final requests = <http.Request>[];
+      final board = MissionBoard(
+        apiOrigin: Uri.parse('https://oo.example'),
+        pollInterval: null,
+        client: MockClient((request) async {
+          requests.add(request);
+          if (request.url.path ==
+              '/v1/user/operations/operation-alpha/missions') {
+            expect(request.headers['authorization'], 'Bearer operator-token');
+            expect(jsonDecode(request.body), {
+              'title': 'Inspect the gateway',
+              'prompt': 'Review the current Operation and report findings.',
+            });
+            return http.Response(
+              jsonEncode({
+                'operation_id': 'operation-alpha',
+                'mission_id': 'oo--mission-123',
+                'state': 'queued',
+              }),
+              202,
+            );
+          }
+          if (request.url.path == '/v1/board') {
+            return http.Response('[]', 200);
+          }
+          if (request.url.path == '/v1/missions') {
+            return http.Response('[]', 200);
+          }
+          if (request.url.path == '/v1/stations') {
+            return http.Response(stationBoardResponse(), 200);
+          }
+          if (request.url.path == '/v1/user/profile') {
+            return http.Response(userProfileResponse(), 200);
+          }
+          if (request.url.path ==
+              '/v1/user/operations/operation-alpha/held-briefs') {
+            return http.Response('[]', 200);
+          }
+          fail('Unexpected request ${request.url}');
+        }),
+      );
+      board.accessToken = 'operator-token';
+      addTearDown(board.dispose);
+
+      final missionId = await board.createMission(
+        operationId: 'operation-alpha',
+        title: 'Inspect the gateway',
+        prompt: 'Review the current Operation and report findings.',
+      );
+
+      expect(missionId, 'oo--mission-123');
+      expect(requests.map((request) => request.url.path), [
+        '/v1/user/operations/operation-alpha/missions',
+        '/v1/board',
+        '/v1/missions',
+        '/v1/stations',
+        '/v1/user/profile',
+        '/v1/user/operations/operation-alpha/held-briefs',
+        '/v1/user/operations/operation-alpha/mission-proposals',
+      ]);
+    },
+  );
+
+  test(
+    'proposal review calls the authorized list and approval endpoints',
+    () async {
+      final requests = <http.Request>[];
+      final board = MissionBoard(
+        apiOrigin: Uri.parse('https://oo.example'),
+        pollInterval: null,
+        client: MockClient((request) async {
+          requests.add(request);
+          if (request.url.path.endsWith('/mission-proposals')) {
+            return http.Response(
+              jsonEncode([
+                {
+                  'id': 'proposal-123',
+                  'operation_id': 'operation-alpha',
+                  'parent_mission_id': 'parent-1',
+                  'proposer_agent_id': 'coordinator-007',
+                  'proposer_session_id': 'provider-session-9',
+                  'created_at': 1_798_000_000,
+                  'brief': {
+                    'title': 'Review the gateway',
+                    'body': 'Check its permission boundaries.',
+                    'role': 'analyst',
+                    'tags': ['security'],
+                    'priority': 1,
+                  },
+                },
+              ]),
+              200,
+            );
+          }
+          if (request.method == 'POST' &&
+              request.url.path.endsWith('/approve')) {
+            expect(request.headers['authorization'], 'Bearer operator-token');
+            return http.Response(
+              jsonEncode({
+                'operation_id': 'operation-alpha',
+                'proposal_id': 'proposal-123',
+                'mission_id': 'ai6-agent-proposal--proposal-123',
+                'state': 'queued',
+              }),
+              202,
+            );
+          }
+          if (request.url.path == '/v1/board' ||
+              request.url.path == '/v1/missions') {
+            return http.Response('[]', 200);
+          }
+          if (request.url.path == '/v1/stations') {
+            return http.Response(stationBoardResponse(), 200);
+          }
+          if (request.url.path == '/v1/user/profile') {
+            return http.Response(userProfileResponse(), 200);
+          }
+          fail('Unexpected request ${request.url}');
+        }),
+      );
+      board.accessToken = 'operator-token';
+      board.userSession = UserSessionSummary.fromJson(
+        jsonDecode(userProfileResponse()) as Map<String, dynamic>,
+      );
+      addTearDown(board.dispose);
+
+      final proposals = await board.loadMissionProposals('operation-alpha');
+      expect(proposals.single.proposerSessionId, 'provider-session-9');
+      expect(proposals.single.body, 'Check its permission boundaries.');
+      await board.decideMissionProposal(
+        operationId: 'operation-alpha',
+        proposalId: proposals.single.id,
+        approve: true,
+      );
+
+      expect(
+        requests.first.url.path,
+        '/v1/user/operations/operation-alpha/mission-proposals',
+      );
+      expect(requests.first.headers['authorization'], 'Bearer operator-token');
+      expect(
+        requests[1].url.path,
+        '/v1/user/operations/operation-alpha/mission-proposals/proposal-123/approve',
+      );
+    },
+  );
+
+  test(
+    'operator menu identity uses the authenticated gateway session',
+    () async {
+      final requests = <http.Request>[];
+      final themeWrites = <String>[];
+      final board = MissionBoard(
+        apiOrigin: Uri.parse('https://oo.example'),
+        pollInterval: null,
+        onThemeChanged: (themeId) async => themeWrites.add(themeId),
+        client: MockClient((request) async {
+          requests.add(request);
+          return http.Response(
+            jsonEncode({
+              'person_id': 'operator-007',
+              'name': 'operator',
+              'display_name': 'Operator 007',
+              'groups': ['field'],
+              'expires_at': 1_900_000_000,
+              'operations': [
+                {
+                  'operation_id': 'operation-alpha',
+                  'actions': ['mission.read', 'session.read'],
+                },
+              ],
+            }),
+            200,
+          );
+        }),
+      );
+      board.accessToken = 'operator-token';
+      addTearDown(board.dispose);
+
+      final identity = await board.loadUserSession();
+      expect(identity.personId, 'operator-007');
+      expect(identity.expiresAt, 1_900_000_000);
+      expect(requests.single.url.path, '/v1/user/profile');
+      expect(requests.single.headers['authorization'], 'Bearer operator-token');
+      expect(board.canCreateMission('operation-alpha'), isFalse);
+
+      expect(board.themeId, 'night-ops');
+      board.setThemeId('light');
+      expect(board.themeId, 'light');
+      board.setThemeId('dusk-x');
+      expect(board.themeId, 'night-ops');
+      await Future<void>.delayed(Duration.zero);
+      expect(themeWrites, ['light', 'night-ops']);
+    },
+  );
+
+  test(
+    'audit request is bearer-authenticated and keeps metadata fields',
+    () async {
+      final requests = <http.Request>[];
+      final board = MissionBoard(
+        apiOrigin: Uri.parse('https://oo.example'),
+        pollInterval: null,
+        client: MockClient((request) async {
+          requests.add(request);
+          return http.Response(
+            jsonEncode([
+              {
+                'id': 'audit-001',
+                'actor': 'operator-007',
+                'action': 'mission.create.requested',
+                'operation': 'operation-alpha',
+                'target': 'mission-007',
+                'at': 1_900_000_000,
+              },
+            ]),
+            200,
+          );
+        }),
+      );
+      board.accessToken = 'operator-token';
+      addTearDown(board.dispose);
+
+      final records = await board.loadAudit();
+
+      expect(requests.single.url.path, '/v1/user/audit');
+      expect(requests.single.url.queryParameters, {'limit': '100'});
+      expect(requests.single.headers['authorization'], 'Bearer operator-token');
+      expect(records.single.actor, 'operator-007');
+      expect(records.single.action, 'mission.create.requested');
+      expect(records.single.target, 'mission-007');
+    },
+  );
+
+  test(
+    'Agent role administration uses the authenticated Operation routes',
+    () async {
+      final requests = <http.Request>[];
+      final board = MissionBoard(
+        apiOrigin: Uri.parse('https://oo.example'),
+        pollInterval: null,
+        client: MockClient((request) async {
+          requests.add(request);
+          if (request.method == 'GET') {
+            return http.Response(
+              jsonEncode([
+                {
+                  'id': 'case-officer',
+                  'purpose': 'Coordinate Mission work.',
+                  'policy': 'Follow the Operation policy.',
+                },
+              ]),
+              200,
+            );
+          }
+          return http.Response('', 204);
+        }),
+      );
+      board.accessToken = 'operator-token';
+      addTearDown(board.dispose);
+
+      final roles = await board.loadAgentRoles('operation-alpha');
+      expect(roles.single.id, 'case-officer');
+      expect(roles.single.policy, 'Follow the Operation policy.');
+      await board.saveAgentRole('operation-alpha', roles.single);
+      await board.deleteAgentRole('operation-alpha', 'case-officer');
+
+      expect(requests.map((request) => request.method), [
+        'GET',
+        'PUT',
+        'DELETE',
+      ]);
+      expect(requests.map((request) => request.url.path), [
+        '/v1/user/operations/operation-alpha/agent-roles',
+        '/v1/user/operations/operation-alpha/agent-roles/case-officer',
+        '/v1/user/operations/operation-alpha/agent-roles/case-officer',
+      ]);
+      expect(
+        requests.every(
+          (request) =>
+              request.headers['authorization'] == 'Bearer operator-token',
+        ),
+        isTrue,
+      );
+      expect(
+        jsonDecode(requests[1].body)['purpose'],
+        'Coordinate Mission work.',
+      );
+    },
+  );
+
+  test('session attachment exchanges a scoped grant for a cookie', () async {
+    final requests = <http.Request>[];
+    final board = MissionBoard(
+      apiOrigin: Uri.parse('https://oo.example'),
+      pollInterval: null,
+      client: MockClient((request) async {
+        requests.add(request);
+        if (request.url.path == '/v1/user/attach-grants') {
+          return http.Response(jsonEncode({'token': 'scoped-grant'}), 201);
+        }
+        expect(request.url.path, '/v1/attach');
+        return http.Response(
+          '',
+          204,
+          headers: {'set-cookie': 'ai6_attach=one-use-ticket; Path=/v1/socket'},
+        );
+      }),
+    );
+    board.accessToken = 'user-token';
+    addTearDown(board.dispose);
+
+    final cookie = await board.prepareSessionSocket(
+      const SessionSummary(
+        operationId: 'station-a',
+        missionId: 'mission-1',
+        sessionId: 'agent-session-1',
+        state: 'working',
+        sequence: 4,
+      ),
+      write: false,
+    );
+
+    expect(cookie, 'ai6_attach=one-use-ticket');
+    expect(requests.map((request) => request.url.path), [
+      '/v1/user/attach-grants',
+      '/v1/attach',
+    ]);
+    expect(requests.first.headers['authorization'], 'Bearer user-token');
+    expect(jsonDecode(requests.first.body), {
+      'operation_id': 'station-a',
+      'mission_id': 'mission-1',
+      'session_id': 'agent-session-1',
+      'mode': 'read',
+    });
+    expect(requests.last.headers['origin'], 'https://oo.example');
+    expect(requests.last.headers['x-forwarded-proto'], 'https');
+    expect(jsonDecode(requests.last.body), {'token': 'scoped-grant'});
+    expect(
+      requests.every((request) => request.url.queryParameters.isEmpty),
+      isTrue,
+    );
+  });
+
+  testWidgets('board groups and renders gateway Session snapshots', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(800, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final board = MissionBoard(
+      apiOrigin: Uri.parse('https://oo.example'),
+      pollInterval: null,
+      client: MockClient((request) async {
+        if (request.method == 'POST') {
+          expect(request.url.path, '/v1/auth/login');
+          expect(jsonDecode(request.body), {
+            'name': 'operator',
+            'secret': 'secret',
+          });
+          return http.Response(jsonEncode({'token': 'user-token'}), 201);
+        }
+        expect(request.headers['authorization'], 'Bearer user-token');
+        if (request.url.path == '/v1/missions') {
+          return http.Response(
+            jsonEncode([
+              {
+                'operation_id': 'operation-alpha',
+                'mission_id': 'mission-007',
+                'sessions': [],
+                'brief': {
+                  'prompt': 'Review the requested change.',
+                  'agent_id': 'technical-officer',
+                  'role_id': 'case-officer',
+                  'handler_provider': 'claude',
+                  'terminal_provider': 'pty',
+                  'working_directory': 'C:/stations/alpha',
+                  'model': 'claude-sonnet',
+                  'effort': 'high',
+                  'environment_keys': ['AI6_MISSION_ID'],
+                  'station_id': 'station-alpha',
+                  'theater_id': 'local',
+                  'mode': 'field',
+                  'provenance': {
+                    'origin': 'registry_drop',
+                    'received_at': 1792922400,
+                    'received_by': 'station-alpha',
+                    'digest': 'sha256:${'0' * 64}',
+                  },
+                },
+                'attempts': [
+                  {
+                    'attempt': 1,
+                    'session_id': 'attempt-1',
+                    'provider_session_id': 'claude-session-000',
+                    'predecessor': null,
+                    'station': 'station-beta',
+                    'theater': 'local',
+                    'status': 'lost',
+                    'lost': 'Station "station-beta" went dark',
+                    'checkpoint_branch': 'mission-007-review',
+                  },
+                  {
+                    'attempt': 2,
+                    'session_id': 'attempt-2',
+                    'provider_session_id': 'claude-session-123',
+                    'predecessor': 'attempt-1',
+                    'station': 'station-alpha',
+                    'theater': 'local',
+                    'status': 'active',
+                    'lost': null,
+                    'checkpoint_branch': null,
+                  },
+                ],
+              },
+            ]),
+            200,
+          );
+        }
+        if (request.url.path == '/v1/stations') {
+          return http.Response(stationBoardResponse(), 200);
+        }
+        if (request.url.path == '/v1/user/profile') {
+          return http.Response(userProfileResponse(), 200);
+        }
+        if (request.url.path ==
+            '/v1/user/operations/operation-alpha/placement-preview') {
+          return http.Response(
+            jsonEncode({
+              'operation_id': 'operation-alpha',
+              'policy_station': 'station-alpha',
+              'choices': [
+                {
+                  'station': 'station-alpha',
+                  'theater': 'local',
+                  'agent': '007',
+                  'handler': 'claude',
+                  'mode': 'field',
+                  'score': 1.25,
+                },
+                {
+                  'station': 'station-alpha',
+                  'theater': 'build-box',
+                  'agent': '007',
+                  'handler': 'claude',
+                  'mode': 'remote-hands',
+                  'score': 2.5,
+                },
+              ],
+              'rejections': [
+                {
+                  'station': 'station-beta',
+                  'theater': null,
+                  'agent': null,
+                  'reason': 'it is at capacity (2 of 2 Missions)',
+                },
+                {
+                  'station': null,
+                  'theater': null,
+                  'agent': '008',
+                  'reason': 'it has no handler configured',
+                },
+                {
+                  'station': 'station-alpha',
+                  'theater': 'lab',
+                  'agent': '007',
+                  'reason':
+                      'harness "claude" is missing on this Theater: '
+                      'claude>=2.1: not installed',
+                },
+              ],
+            }),
+            200,
+          );
+        }
+        expect(request.url.path, '/v1/board');
+        return http.Response(
+          jsonEncode([
+            {
+              'operation_id': 'operation-alpha',
+              'mission_id': 'mission-007',
+              'session_id': 'claude-session-123',
+              'state': 'working',
+              'sequence': 4,
+              'updated_at': 100,
+            },
+            {
+              'operation_id': 'operation-alpha',
+              'mission_id': 'mission-007',
+              'session_id': 'codex-session-456',
+              'state': 'blocked',
+              'sequence': 9,
+              'updated_at': 200,
+            },
+            {
+              'operation_id': 'operation-alpha',
+              'mission_id': 'mission-007',
+              'session_id': 'claude-session-789',
+              'state': 'parked',
+              'sequence': 3,
+              'exposure': ['brief:source', 'tool:WebFetch'],
+            },
+            {
+              'operation_id': 'operation-alpha',
+              'mission_id': 'mission-007',
+              'session_id': 'claude-session-901',
+              'state': 'quarantined',
+              'sequence': 2,
+            },
+          ]),
+          200,
+        );
+      }),
+    );
+    addTearDown(board.dispose);
+    await board.login('operator', 'secret');
+
+    await tester.pumpWidget(
+      OuterOfficeApp(board: board, desktopWindows: false),
+    );
+    await openPage(tester, 'Missions');
+
+    expect(find.text('Missions'), findsOneWidget);
+    expect(find.text('Operation operation-alpha'), findsOneWidget);
+    expect(find.text('Mission mission-007'), findsOneWidget);
+    expect(find.text('Attempt 1'), findsOneWidget);
+    expect(find.text('Station station-beta'), findsOneWidget);
+    expect(find.text('Station "station-beta" went dark'), findsOneWidget);
+    expect(
+      find.text('Checkpointed to branch mission-007-review'),
+      findsOneWidget,
+    );
+    expect(find.text('Attempt 2'), findsOneWidget);
+    expect(find.text('Station station-alpha'), findsWidgets);
+    expect(find.text('claude-session-123'), findsOneWidget);
+    expect(find.text('codex-session-456'), findsOneWidget);
+    expect(find.text('WORKING'), findsOneWidget);
+    expect(find.text('BLOCKED'), findsOneWidget);
+    expect(find.text('PARKED'), findsOneWidget);
+    expect(find.text('QUARANTINED'), findsOneWidget);
+    expect(find.text('EXPOSED'), findsOneWidget);
+    expect(
+      find.byTooltip('Read untrusted input: brief:source, tool:WebFetch'),
+      findsOneWidget,
+    );
+
+    await openPage(tester, 'Stations');
+    expect(find.text('HQS'), findsOneWidget);
+    expect(find.text('station-alpha'), findsOneWidget);
+    expect(find.textContaining('2 of 4 Sessions'), findsOneWidget);
+    expect(
+      find.text(
+        '8 CPUs \u00b7 25% busy \u00b7 load 1.50 \u00b7 12.0 GiB free of 16.0 GiB '
+        '\u00b7 sampled ${const HostResources(sampledAt: 1000).sampledTime}',
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.text(
+        const StationLogReport(at: 1000, summary: '', agent: 'M').heading,
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.text('Disk at 12% free; two safe houses hold 40 GB of caches.'),
+      findsOneWidget,
+    );
+    expect(
+      find.text('disk: 12% free under the state directory'),
+      findsOneWidget,
+    );
+    expect(
+      find.text('safe-house: mission-9 holds unexported commits'),
+      findsOneWidget,
+    );
+    expect(find.text('Theater local'), findsOneWidget);
+    expect(find.text('Theater build-box'), findsOneWidget);
+    expect(
+      find.byTooltip(
+        'ssh build.example.net \u00b7 os=linux\n'
+        '1.5 CPUs \u00b7 CPU busy unknown \u00b7 load 0.50 \u00b7 free memory unknown '
+        'of 256 MiB \u00b7 sampled ${const HostResources(sampledAt: 1010).sampledTime}\n'
+        '1 running\n'
+        'terminal, run, files \u00b7 linux/x86_64\n'
+        'agents remote-hands \u00b7 egress none',
+      ),
+      findsOneWidget,
+    );
+    expect(find.text('Theater lab'), findsOneWidget);
+    expect(
+      find.byTooltip(
+        'local\n'
+        'resources unknown\n'
+        'agents auto \u00b7 egress direct\n'
+        'requires claude>=2.1, git\n'
+        'unmet: claude>=2.1: not installed\n'
+        'found git git version 2.47.0\n'
+        'weakened: ambient credential on the Theater: an SSH agent (SSH_AUTH_SOCK)',
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.byTooltip(
+        'ephemeral ephemeral-container\n'
+        'a fresh Theater is made for each Mission\n'
+        'resources unknown\n'
+        'agents remote-hands · egress direct',
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.byTooltip(
+        'transport container\n'
+        'made for Mission mission-007\n'
+        'resources unknown\n'
+        'agents remote-hands · egress direct',
+      ),
+      findsOneWidget,
+    );
+    await tester.tap(find.widgetWithText(Tab, 'Placement'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Preview placement'));
+    await tester.pumpAndSettle();
+    expect(find.text('score 1.25'), findsOneWidget);
+    expect(find.text('score 2.50'), findsOneWidget);
+    expect(find.text('it is at capacity (2 of 2 Missions)'), findsOneWidget);
+    expect(find.text('Agent 008: '), findsOneWidget);
+    expect(find.text('it has no handler configured'), findsOneWidget);
+    expect(find.text('station-alpha / lab / Agent 007: '), findsOneWidget);
+    expect(
+      find.text(
+        'harness "claude" is missing on this Theater: claude>=2.1: not installed',
+      ),
+      findsOneWidget,
+    );
+    expect(find.text('operation-alpha'), findsOneWidget);
+    expect(find.text('claude-session-123'), findsNothing);
+    await openPage(tester, 'Missions');
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byTooltip('View Mission brief and launch context'));
+    await tester.pumpAndSettle();
+    expect(find.text('Review the requested change.'), findsOneWidget);
+    expect(
+      find.text(
+        'Dropped into the Registry queue (unauthenticated), found by station-alpha',
+      ),
+      findsOneWidget,
+    );
+    expect(find.text('case-officer'), findsOneWidget);
+    expect(find.text('station-alpha'), findsOneWidget);
+    expect(find.text('local'), findsOneWidget);
+    expect(find.text('field'), findsOneWidget);
+    expect(find.text('AI6_MISSION_ID'), findsOneWidget);
+    expect(find.text('Environment values are withheld.'), findsOneWidget);
+    await tester.pageBack();
+    await tester.pumpAndSettle();
+
+    // The Mission's latest Session is the blocked one, so it is a blocked Mission with all of
+    // its Sessions, and not a parked one for an older Session.
+    await tester.tap(find.byTooltip('Missions that are blocked'));
+    await tester.pumpAndSettle();
+    expect(find.text('claude-session-123'), findsOneWidget);
+    expect(find.text('codex-session-456'), findsOneWidget);
+
+    await tester.tap(find.byTooltip('Missions that are parked'));
+    await tester.pumpAndSettle();
+    expect(find.text('claude-session-789'), findsNothing);
+    expect(find.text('No Missions match these filters.'), findsOneWidget);
+
+    await tester.tap(find.byTooltip('Show every Mission'));
+    await tester.pumpAndSettle();
+    expect(find.text('claude-session-123'), findsOneWidget);
+    expect(find.text('codex-session-456'), findsOneWidget);
+    expect(find.text('claude-session-789'), findsOneWidget);
+
+    await tester.tap(find.text('claude-session-123'));
+    await tester.pumpAndSettle();
+    expect(find.text('Session claude-session-123'), findsOneWidget);
+  });
+
+  testWidgets('demo Session details explain that terminal data is offline', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(800, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final board = MissionBoard(
+      apiOrigin: Uri.parse('http://127.0.0.1:7082'),
+      demo: true,
+      pollInterval: null,
+    );
+    addTearDown(board.dispose);
+
+    await tester.pumpWidget(
+      OuterOfficeApp(board: board, desktopWindows: false),
+    );
+    await openPage(tester, 'Missions');
+    await tester.tap(find.text('preview-session-007'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Session preview-session-007'), findsOneWidget);
+    expect(
+      find.text(
+        'Demo Sessions are sample data. No terminal connection is available.',
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.text('Sign in to Universal Exports to attach to this Session.'),
+      findsNothing,
+    );
+
+    await tester.pageBack();
+    await tester.pumpAndSettle();
+    expect(find.text('preview-session-007'), findsOneWidget);
+    expect(
+      board.sessions
+          .singleWhere((session) => session.sessionId == 'preview-session-007')
+          .state,
+      'working',
+    );
+  });
+
+  testWidgets('wide web view keeps the Mission board beside Session detail', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1600, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final board = MissionBoard(
+      apiOrigin: Uri.parse('http://127.0.0.1:7082'),
+      demo: true,
+      pollInterval: null,
+    );
+    addTearDown(board.dispose);
+
+    await tester.pumpWidget(
+      OuterOfficeApp(board: board, desktopWindows: false),
+    );
+    await openPage(tester, 'Missions');
+    await tester.tap(find.text('preview-session-007'));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.text('Each Mission is one brief of work under an Operation.'),
+      findsOneWidget,
+    );
+    expect(find.text('preview-session-007'), findsOneWidget);
+    expect(find.text('Session preview'), findsOneWidget);
+    expect(find.byTooltip('Close Session details'), findsOneWidget);
+
+    await tester.tap(find.byTooltip('Close Session details'));
+    await tester.pumpAndSettle();
+    expect(
+      find.text('Each Mission is one brief of work under an Operation.'),
+      findsOneWidget,
+    );
+    expect(find.text('Session preview'), findsNothing);
+    expect(find.text('preview-session-007'), findsOneWidget);
+  });
+
+  testWidgets('demo audit view renders only sample event metadata', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(800, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final board = MissionBoard(
+      apiOrigin: Uri.parse('http://127.0.0.1:7082'),
+      demo: true,
+      pollInterval: null,
+    );
+    addTearDown(board.dispose);
+
+    await tester.pumpWidget(
+      OuterOfficeApp(board: board, desktopWindows: false),
+    );
+    await openPage(tester, 'Audit');
+    await tester.pumpAndSettle();
+
+    expect(
+      find.text('operator-007 · Mission create requested'),
+      findsOneWidget,
+    );
+    expect(find.text('oo--mission-007'), findsOneWidget);
+    expect(find.textContaining('prompt'), findsNothing);
+  });
+
+  testWidgets('operator menu shows account identity and theme preference', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(800, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final board = MissionBoard(
+      apiOrigin: Uri.parse('https://oo.example'),
+      pollInterval: null,
+      client: MockClient((request) async {
+        if (request.url.path == '/v1/user/profile') {
+          return http.Response(
+            jsonEncode({
+              'person_id': 'operator-007',
+              'name': 'operator',
+              'display_name': 'Operator 007',
+              'groups': ['field'],
+              'expires_at': 1_900_000_000,
+              'operations': [
+                {
+                  'operation_id': 'operation-alpha',
+                  'actions': ['mission.read', 'session.read'],
+                },
+              ],
+            }),
+            200,
+          );
+        }
+        fail('Unexpected request ${request.url}');
+      }),
+    );
+    board.accessToken = 'operator-token';
+    board.loading = false;
+    board.userSession = UserSessionSummary.fromJson({
+      'person_id': 'operator-007',
+      'name': 'operator',
+      'display_name': 'Operator 007',
+      'groups': ['field'],
+      'expires_at': 1_900_000_000,
+      'operations': [
+        {
+          'operation_id': 'operation-alpha',
+          'actions': ['mission.read', 'session.read'],
+        },
+      ],
+    });
+    board.stationBoard = StationBoardSummary.fromJson(
+      jsonDecode(stationBoardResponse()) as Map<String, dynamic>,
+    );
+    addTearDown(board.dispose);
+
+    await tester.pumpWidget(
+      OuterOfficeApp(board: board, desktopWindows: false),
+    );
+    expect(find.text('O'), findsOneWidget);
+    await tester.tap(find.byTooltip('Your account and settings'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Person ID: operator-007'), findsOneWidget);
+    expect(find.text('Your access by Operation'), findsOneWidget);
+    expect(find.byTooltip('mission.read'), findsOneWidget);
+    expect(find.byTooltip('session.read'), findsOneWidget);
+    await tester.ensureVisible(find.text('Light'));
+    await tester.tap(find.text('Light'));
+    await tester.pumpAndSettle();
+    expect(board.themeId, 'light');
+    await tester.ensureVisible(find.byType(SwitchListTile));
+    await tester.tap(find.byType(SwitchListTile));
+    await tester.pumpAndSettle();
+    expect(board.backdrop, isFalse);
+    await tester.tap(find.text('Close'));
+    await tester.pumpAndSettle();
+  });
+
+  testWidgets('audit log navigation is permission-gated and shows metadata', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(800, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final board = MissionBoard(
+      apiOrigin: Uri.parse('https://oo.example'),
+      pollInterval: null,
+      client: MockClient((request) async {
+        expect(request.url.path, '/v1/user/audit');
+        expect(request.headers['authorization'], 'Bearer operator-token');
+        return http.Response(
+          jsonEncode([
+            {
+              'id': 'audit-001',
+              'actor': 'operator-007',
+              'action': 'mission.create.requested',
+              'operation': 'operation-alpha',
+              'target': 'mission-007',
+              'at': 1_900_000_000,
+            },
+          ]),
+          200,
+        );
+      }),
+    );
+    board.accessToken = 'operator-token';
+    board.loading = false;
+    board.userSession = UserSessionSummary.fromJson(
+      jsonDecode(userProfileResponse(actions: ['mission.read', 'audit.read']))
+          as Map<String, dynamic>,
+    );
+    addTearDown(board.dispose);
+
+    await tester.pumpWidget(
+      OuterOfficeApp(board: board, desktopWindows: false),
+    );
+    await openPage(tester, 'Audit');
+    await tester.pumpAndSettle();
+
+    expect(find.text('Audit'), findsOneWidget);
+    expect(
+      find.text('operator-007 · Mission create requested'),
+      findsOneWidget,
+    );
+    expect(find.text('mission-007'), findsOneWidget);
+    expect(find.textContaining('prompt'), findsNothing);
+  });
+
+  testWidgets('sign in loads only the authenticated board', (tester) async {
+    final requests = <http.Request>[];
+    final board = MissionBoard(
+      apiOrigin: Uri.parse('https://oo.example'),
+      pollInterval: null,
+      client: MockClient((request) async {
+        requests.add(request);
+        if (request.url.path == '/v1/auth/login') {
+          expect(request.method, 'POST');
+          expect(jsonDecode(request.body), {
+            'name': 'operator',
+            'secret': 'secret',
+          });
+          return http.Response(jsonEncode({'token': 'user-token'}), 201);
+        }
+        if (request.url.path == '/v1/missions') {
+          expect(request.headers['authorization'], 'Bearer user-token');
+          return http.Response('[]', 200);
+        }
+        if (request.url.path == '/v1/stations') {
+          return http.Response(stationBoardResponse(), 200);
+        }
+        if (request.url.path == '/v1/user/profile') {
+          return http.Response(userProfileResponse(), 200);
+        }
+        if (request.url.path ==
+            '/v1/user/operations/operation-alpha/held-briefs') {
+          expect(request.headers['authorization'], 'Bearer user-token');
+          return http.Response(
+            jsonEncode([
+              {
+                'key': 'source_github--org_repo_9',
+                'operation': 'operation-alpha',
+                'brief': {
+                  'title': 'Fix the\u200B login page',
+                  'body': 'Untrusted text.',
+                  'source': 'source:github',
+                },
+                'vetting': {'verdict': 'hold', 'findings': []},
+                'held_at': 1000.0,
+              },
+            ]),
+            200,
+            headers: {'content-type': 'application/json'},
+          );
+        }
+        expect(request.url.path, '/v1/board');
+        expect(request.headers['authorization'], 'Bearer user-token');
+        return http.Response(
+          jsonEncode([
+            {
+              'operation_id': 'operation-alpha',
+              'mission_id': 'mission-007',
+              'session_id': 'claude-session-123',
+              'state': 'working',
+              'sequence': 4,
+            },
+          ]),
+          200,
+        );
+      }),
+    );
+    addTearDown(board.dispose);
+
+    await tester.pumpWidget(
+      OuterOfficeApp(board: board, desktopWindows: false),
+    );
+    expect(find.text('Sign in'), findsOneWidget);
+
+    await tester.enterText(find.byType(TextField).at(0), 'operator');
+    await tester.enterText(find.byType(TextField).at(1), 'secret');
+    await tester.pump();
+    await tester.tap(find.text('Continue'));
+    await tester.pumpAndSettle();
+
+    // Signing in opens Overview, which lists the brief vetting holds.
+    expect(find.text('Overview'), findsOneWidget);
+    expect(find.text('Command overview'), findsOneWidget);
+    expect(
+      find.text(
+        'Brief "Fix the<U+200B> login page" is held for review in Operation '
+        'operation-alpha',
+      ),
+      findsOneWidget,
+    );
+    expect(find.text('Open Briefings'), findsOneWidget);
+    await openPage(tester, 'Missions');
+    expect(find.text('Missions'), findsOneWidget);
+    expect(find.text('claude-session-123'), findsOneWidget);
+    await openPage(tester, 'Stations');
+    expect(find.text('station-alpha'), findsOneWidget);
+    expect(find.text('claude-session-123'), findsNothing);
+    expect(requests.map((request) => request.url.path), [
+      '/v1/auth/methods',
+      '/v1/auth/login',
+      '/v1/board',
+      '/v1/missions',
+      '/v1/stations',
+      '/v1/user/profile',
+      '/v1/user/operations/operation-alpha/held-briefs',
+      '/v1/user/operations/operation-alpha/mission-proposals',
+    ]);
+  });
+
+  testWidgets('Continue is enabled only when both credentials are present', (
+    tester,
+  ) async {
+    final board = MissionBoard(
+      apiOrigin: Uri.parse('https://oo.example'),
+      pollInterval: null,
+      client: MockClient((_) async => http.Response('', 500)),
+    );
+    addTearDown(board.dispose);
+
+    await tester.pumpWidget(
+      OuterOfficeApp(board: board, desktopWindows: false),
+    );
+
+    FilledButton button() =>
+        tester.widget<FilledButton>(find.byType(FilledButton));
+    expect(button().onPressed, isNull);
+
+    await tester.enterText(find.byType(TextField).at(0), 'operator');
+    await tester.pump();
+    expect(button().onPressed, isNull);
+
+    await tester.enterText(find.byType(TextField).at(1), 'secret');
+    await tester.pump();
+    expect(button().onPressed, isNotNull);
+  });
+}

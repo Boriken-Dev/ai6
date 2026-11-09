@@ -1,0 +1,1604 @@
+//! Durable Mission lifecycle owned by the AI6 daemon.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::directorates::m::cover::{CoverAudit, CoverReport};
+use crate::directorates::m::placement::ExecutionMode;
+use crate::directorates::m::review::BriefNaming;
+use crate::directorates::q::safehouse::SafeHouseReport;
+use crate::directorates::registry::bona_fides::Provenance;
+use crate::{MissionId, SessionId};
+
+/// Lifecycle state for a Mission.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionState {
+    /// Accepted by AI6 and waiting for assignment.
+    Queued,
+    /// An agent operation is active.
+    Working,
+    /// Waiting on an external condition.
+    Blocked,
+    /// No progress has been observed within the configured limit.
+    Stalled,
+    /// The work completed successfully.
+    Done,
+    /// The work ended unsuccessfully.
+    Failed,
+    /// The work completed but violated its Operation's cover policy.
+    Blown,
+    /// The work was withdrawn or handed off.
+    Abandoned,
+    /// A provider usage limit paused the work; it resumes when `parked_until` passes.
+    Parked,
+    /// Medical or an operator stopped the work because its Agent is quarantined; only an
+    /// operator releases it.
+    Quarantined,
+    /// Its Session ended done with nothing a role requires, so a person's verdict settles it: the
+    /// work is kept and no harness runs. `blocked_reason` says why.
+    Held,
+    /// Its Session ended done, and the work is kept for someone to check against what the
+    /// Mission was to deliver. It leaves this state only by a decision: done, redispatched as
+    /// the next attempt, or failed.
+    Verifying,
+}
+
+impl MissionState {
+    /// The state as Universal Exports and its clients spell it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Working => "working",
+            Self::Blocked => "blocked",
+            Self::Stalled => "stalled",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Blown => "blown",
+            Self::Abandoned => "abandoned",
+            Self::Parked => "parked",
+            Self::Quarantined => "quarantined",
+            Self::Held => "held",
+            Self::Verifying => "verifying",
+        }
+    }
+}
+
+/// A Mission as stored and returned by the daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mission {
+    /// AI6-owned identifier for the unit of work: the Mission's UID when it came from the
+    /// Registry.
+    pub mission_id: MissionId,
+    /// The Mission's handle as this Station last learned it; the Registry holds the current one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+    /// What to show beside the ID: a person's title, or an issue's title as data. It is no
+    /// part of what the Agent is told.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Registered Operation that owns the work, when specified.
+    pub operation_id: Option<String>,
+    /// Task instruction for the selected Agent.
+    pub prompt: String,
+    /// Configured Agent identity, when assigned.
+    pub agent_id: Option<String>,
+    /// Canonical configured Agent role requested for this Mission, when specified.
+    #[serde(default)]
+    pub role_id: Option<String>,
+    /// Current lifecycle state.
+    pub state: MissionState,
+    /// Provider-issued operation identities belonging to this Mission.
+    pub session_ids: Vec<SessionId>,
+    /// Isolated Operation worktree and final disposition, when one was created.
+    pub safe_house: Option<SafeHouseReport>,
+    /// Cover policy result, when the Operation's commits were audited.
+    pub cover: Option<CoverReport>,
+    /// Monotonically increasing state revision.
+    pub revision: u64,
+    /// When a parked Mission resumes, as Unix seconds; set only while `state` is `Parked`.
+    #[serde(default)]
+    pub parked_until: Option<i64>,
+    /// Why a blocked Mission stopped when AI6 itself stopped it (`budget`), or why a held one
+    /// is held; unset when the Agent or the terminal is what is waiting. Cleared by the next
+    /// state change.
+    #[serde(default)]
+    pub blocked_reason: Option<String>,
+    /// Why AI6 failed the Mission without its Agent: a harness that cannot be started, or an
+    /// attempt a standing order's next window superseded. Cleared by the next state change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
+    /// What its harness said when it reported the Mission failed, which may quote anything: it
+    /// goes in the attempt's outcome and on no metadata-only record. Cleared by the next state
+    /// change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_failure: Option<String>,
+    /// Why this attempt starts a new Session though its order says to resume: the provider could
+    /// not resume the last one. Cleared by the next attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_refused: Option<String>,
+    /// Whether the attempt before this one ended failed or blown, as this Station's book had it
+    /// when the Mission was queued again: this attempt does not take up that attempt's Session.
+    /// The book says so before the Session record does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub after_failure: bool,
+    /// Queued again on this Station's word after its brief was filed, by an operator's retry or a
+    /// review: it runs, though the Registry's record of that brief has ended. Cleared when it
+    /// starts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub runs_past_brief: bool,
+    /// Untrusted input the Mission itself came from (`brief:source`, or the exposure of the
+    /// Session that proposed it); every Session of the Mission starts exposed by it.
+    #[serde(default)]
+    pub exposure: Vec<String>,
+    /// Where the Mission's brief came from, as AI6 recorded it where the brief entered;
+    /// `None` for a Mission started directly on the Station rather than from the queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Provenance>,
+    /// Why a queued Mission waits instead of starting, when AI6 holds it back: its Agent may
+    /// not work (retired, quarantined) and no other qualified Agent can take it. Cleared when
+    /// it is reassigned or changes state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<String>,
+    /// The tools the harness refused by its permission rules in its last turn, each once. A turn
+    /// that ends this way can still be `done`, having done nothing that needed them. Cleared when
+    /// the Mission works again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denied_tools: Vec<String>,
+    /// The review policy its brief names, and who the naming speaks for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_naming: Option<BriefNaming>,
+    /// The plan its Agent submitted, until it is put up for review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    /// The content digest of the Registry brief this Station runs it from: another brief for
+    /// a Mission that ended here is its next attempt, and the same one claimed again is a lapse
+    /// recovered. `None` for a Mission not run from the Registry's queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief_digest: Option<String>,
+    /// What each redispatch said was wrong and what to do differently, oldest first: the next
+    /// attempt's task is its brief followed by these. Unlike the brief, they are not what the
+    /// Registry filed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub amendments: Vec<String>,
+}
+
+impl Mission {
+    /// What the harness is told to do: the brief, then what each redispatch added.
+    pub fn task(&self) -> String {
+        let mut task = self.prompt.clone();
+        for amendment in &self.amendments {
+            task.push_str("\n\n");
+            task.push_str(amendment);
+        }
+        task
+    }
+}
+
+/// Mission records held in memory and persisted as one atomic snapshot.
+#[derive(Debug, Default)]
+pub struct MissionStore {
+    missions: BTreeMap<String, Mission>,
+    operations: BTreeMap<String, LaunchManifest>,
+    path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LaunchManifest {
+    pub(crate) handler_provider: String,
+    pub(crate) terminal_provider: String,
+    pub(crate) working_directory: String,
+    pub(crate) model: Option<String>,
+    pub(crate) effort: Option<String>,
+    /// The pool the Session's route names, when it names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pool: Option<String>,
+    pub(crate) cover: Option<CoverAudit>,
+    /// The Station that supervises the Session.
+    pub(crate) station_id: Option<String>,
+    /// The Theater the harness runs in.
+    pub(crate) theater_id: Option<String>,
+    /// Whether the harness runs on the Theater or acts on it from the Station.
+    pub(crate) mode: ExecutionMode,
+    /// The Registry Session record this Station holds for the Mission; `None` until the
+    /// Session is recorded.
+    pub(crate) session: Option<SessionHold>,
+    /// The key of the Session on the Theater's runner, when a runner supervises the harness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) runner: Option<String>,
+    /// The clearance the harness was launched at, which fixed its tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) clearance: Option<String>,
+    /// The overlays the harness was launched with, each at its digest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) overlays: Vec<crate::directorates::q::overlays::IssuedDigest>,
+}
+
+/// What a Station needs to act on its Session record: the record's ID and the fencing token
+/// its lease was granted with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SessionHold {
+    /// AI6's identifier for the Session, the key of the Registry record.
+    pub(crate) id: String,
+    /// Which try at the Mission this Session is.
+    pub(crate) attempt: u32,
+    /// The fencing token presented with every write.
+    pub(crate) fence: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MissionSnapshot {
+    version: u32,
+    missions: BTreeMap<String, Mission>,
+    operations: BTreeMap<String, LaunchManifest>,
+}
+
+impl MissionStore {
+    /// Opens a durable Mission book, creating an empty store when needed.
+    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let (missions, operations) = if path.exists() {
+            let bytes = fs::read(&path)?;
+            let snapshot: MissionSnapshot = serde_json::from_slice(&bytes).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Mission store: {error}"),
+                )
+            })?;
+            if snapshot.version != 1
+                || snapshot.missions.iter().any(|(key, mission)| {
+                    key != mission.mission_id.as_str()
+                        || mission.prompt.trim().is_empty()
+                        || mission.revision == 0
+                })
+                || snapshot.operations.iter().any(|(key, operation)| {
+                    !snapshot.missions.contains_key(key)
+                        || operation.handler_provider.trim().is_empty()
+                        || operation.terminal_provider.trim().is_empty()
+                        || !is_absolute_anywhere(&operation.working_directory)
+                })
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Mission store has an unsupported version or invalid record",
+                ));
+            }
+            (snapshot.missions, snapshot.operations)
+        } else {
+            (BTreeMap::new(), BTreeMap::new())
+        };
+        let book = Self {
+            missions,
+            operations,
+            path: Some(path),
+        };
+        if !book.path.as_deref().is_some_and(Path::exists) {
+            book.persist(&book.missions, &book.operations)?;
+        }
+        Ok(book)
+    }
+
+    /// Creates a queued Mission. The caller supplies the durable identity from the Registry.
+    pub fn create(
+        &mut self,
+        mission_id: MissionId,
+        operation_id: Option<String>,
+        prompt: String,
+        agent_id: Option<String>,
+        role_id: Option<String>,
+    ) -> Result<Mission, MissionError> {
+        if prompt.trim().is_empty() {
+            return Err(MissionError::EmptyPrompt);
+        }
+        let key = mission_id.as_str().to_owned();
+        if self.missions.contains_key(&key) {
+            return Err(MissionError::AlreadyExists);
+        }
+        let mission = Mission {
+            mission_id,
+            handle: None,
+            name: None,
+            operation_id,
+            prompt,
+            agent_id,
+            role_id,
+            state: MissionState::Queued,
+            session_ids: Vec::new(),
+            safe_house: None,
+            cover: None,
+            revision: 1,
+            parked_until: None,
+            blocked_reason: None,
+            failure: None,
+            reported_failure: None,
+            resume_refused: None,
+            after_failure: false,
+            runs_past_brief: false,
+            review_naming: None,
+            plan: None,
+            denied_tools: Vec::new(),
+            exposure: Vec::new(),
+            provenance: None,
+            waiting: None,
+            brief_digest: None,
+            amendments: Vec::new(),
+        };
+        let mut next = self.missions.clone();
+        next.insert(key, mission.clone());
+        self.commit(next)?;
+        Ok(mission)
+    }
+
+    /// Looks up a Mission by its AI6-owned ID.
+    pub fn get(&self, mission_id: &str) -> Option<&Mission> {
+        self.missions.get(mission_id)
+    }
+
+    /// Lists Missions in stable identity order.
+    pub fn list(&self) -> Vec<Mission> {
+        self.missions.values().cloned().collect()
+    }
+
+    #[cfg(feature = "daemon")]
+    pub(crate) fn operation(&self, mission_id: &str) -> Option<LaunchManifest> {
+        self.operations.get(mission_id).cloned()
+    }
+
+    #[cfg(feature = "daemon")]
+    pub(crate) fn set_operation(
+        &mut self,
+        mission_id: &str,
+        operation: LaunchManifest,
+    ) -> Result<(), MissionError> {
+        if !self.missions.contains_key(mission_id) {
+            return Err(MissionError::NotFound);
+        }
+        if operation.handler_provider.trim().is_empty()
+            || operation.terminal_provider.trim().is_empty()
+            || !is_absolute_anywhere(&operation.working_directory)
+        {
+            return Err(MissionError::InvalidOperation);
+        }
+        let mut operations = self.operations.clone();
+        operations.insert(mission_id.to_owned(), operation);
+        self.commit_with(self.missions.clone(), operations)
+    }
+
+    /// Records the Registry Session lease this Station holds for the Mission.
+    #[cfg(feature = "daemon")]
+    pub(crate) fn set_hold(
+        &mut self,
+        mission_id: &str,
+        hold: SessionHold,
+    ) -> Result<(), MissionError> {
+        let mut operations = self.operations.clone();
+        operations
+            .get_mut(mission_id)
+            .ok_or(MissionError::InvalidOperation)?
+            .session = Some(hold);
+        self.commit_with(self.missions.clone(), operations)
+    }
+
+    /// Marks persisted active Missions blocked so an operator can reattach their provider Sessions.
+    #[cfg(feature = "daemon")]
+    pub(crate) fn recover_working(&mut self) -> Result<usize, MissionError> {
+        let mut missions = self.missions.clone();
+        let mut recovered = 0;
+        for mission in missions.values_mut() {
+            if mission.state == MissionState::Working {
+                mission.state = MissionState::Blocked;
+                mission.revision += 1;
+                recovered += 1;
+            }
+        }
+        if recovered > 0 {
+            self.commit(missions)?;
+        }
+        Ok(recovered)
+    }
+
+    /// Changes lifecycle state, rejecting invalid transitions and treating repeats as no-ops.
+    pub fn transition(
+        &mut self,
+        mission_id: &str,
+        state: MissionState,
+    ) -> Result<Mission, MissionError> {
+        let mut next = self.missions.clone();
+        let mission = next.get_mut(mission_id).ok_or(MissionError::NotFound)?;
+        if mission.state == state {
+            return Ok(mission.clone());
+        }
+        if !valid_transition(mission.state, state) {
+            return Err(MissionError::InvalidTransition {
+                from: mission.state,
+                to: state,
+            });
+        }
+        mission.state = state;
+        mission.parked_until = None;
+        mission.blocked_reason = None;
+        mission.failure = None;
+        mission.reported_failure = None;
+        mission.waiting = None;
+        if state == MissionState::Working {
+            mission.denied_tools.clear();
+            mission.runs_past_brief = false;
+        }
+        mission.revision += 1;
+        let updated = mission.clone();
+        self.commit(next)?;
+        Ok(updated)
+    }
+
+    /// Records the tools a turn of the Mission's harness refused.
+    pub fn note_denied_tools(
+        &mut self,
+        mission_id: &str,
+        tools: Vec<String>,
+    ) -> Result<Mission, MissionError> {
+        let mut next = self.missions.clone();
+        let mission = next.get_mut(mission_id).ok_or(MissionError::NotFound)?;
+        mission.denied_tools = tools;
+        mission.revision += 1;
+        let updated = mission.clone();
+        self.commit(next)?;
+        Ok(updated)
+    }
+
+    /// Parks an active Mission until `until` (Unix seconds), when a provider limit resets.
+    ///
+    /// Parking again moves the resume time, so a repeated limit report is harmless.
+    pub fn park(&mut self, mission_id: &str, until: i64) -> Result<Mission, MissionError> {
+        let mut next = self.missions.clone();
+        let mission = next.get_mut(mission_id).ok_or(MissionError::NotFound)?;
+        if !matches!(
+            mission.state,
+            MissionState::Working
+                | MissionState::Blocked
+                | MissionState::Stalled
+                | MissionState::Parked
+        ) {
+            return Err(MissionError::InvalidTransition {
+                from: mission.state,
+                to: MissionState::Parked,
+            });
+        }
+        mission.state = MissionState::Parked;
+        mission.parked_until = Some(until);
+        mission.revision += 1;
+        let updated = mission.clone();
+        self.commit(next)?;
+        Ok(updated)
+    }
+
+    /// Records the untrusted input the Mission came from; it only grows.
+    pub fn expose(&mut self, mission_id: &str, sources: &[String]) -> Result<(), MissionError> {
+        let mut next = self.missions.clone();
+        let mission = next.get_mut(mission_id).ok_or(MissionError::NotFound)?;
+        let before = mission.exposure.len();
+        for source in sources {
+            if !mission.exposure.contains(source) {
+                mission.exposure.push(source.clone());
+            }
+        }
+        if mission.exposure.len() == before {
+            return Ok(());
+        }
+        mission.revision += 1;
+        self.commit(next)
+    }
+
+    /// Keeps the plan the Mission's Agent submitted, or forgets it.
+    pub fn set_plan(&mut self, mission_id: &str, plan: Option<String>) -> Result<(), MissionError> {
+        let mut next = self.missions.clone();
+        let mission = next.get_mut(mission_id).ok_or(MissionError::NotFound)?;
+        mission.plan = plan;
+        mission.revision += 1;
+        self.commit(next)
+    }
+
+    /// Records the review policy the Mission's brief names, and who the naming speaks for.
+    pub fn record_review_naming(
+        &mut self,
+        mission_id: &str,
+        naming: BriefNaming,
+    ) -> Result<(), MissionError> {
+        let mut next = self.missions.clone();
+        let mission = next.get_mut(mission_id).ok_or(MissionError::NotFound)?;
+        mission.review_naming = Some(naming);
+        mission.revision += 1;
+        self.commit(next)
+    }
+
+    /// Records where the Mission's brief came from. The first record stands: a later
+    /// attempt at the same Mission keeps it.
+    pub fn record_provenance(
+        &mut self,
+        mission_id: &str,
+        provenance: Provenance,
+    ) -> Result<(), MissionError> {
+        let mut next = self.missions.clone();
+        let mission = next.get_mut(mission_id).ok_or(MissionError::NotFound)?;
+        if mission.provenance.is_some() {
+            return Ok(());
+        }
+        mission.provenance = Some(provenance);
+        mission.revision += 1;
+        self.commit(next)
+    }
+
+    /// Records the Mission's handle, replacing the one recorded.
+    pub fn record_handle(&mut self, mission_id: &str, handle: String) -> Result<(), MissionError> {
+        let mut next = self.missions.clone();
+        let mission = next.get_mut(mission_id).ok_or(MissionError::NotFound)?;
+        if mission.handle.as_deref() == Some(handle.as_str()) {
+            return Ok(());
+        }
+        mission.handle = Some(handle);
+        mission.revision += 1;
+        self.commit(next)
+    }
+
+    /// Records the name to show beside the Mission's ID, once.
+    pub fn record_name(&mut self, mission_id: &str, name: String) -> Result<(), MissionError> {
+        let mut next = self.missions.clone();
+        let mission = next.get_mut(mission_id).ok_or(MissionError::NotFound)?;
+        if mission.name.is_some() {
+            return Ok(());
+        }
+        mission.name = Some(name);
+        mission.revision += 1;
+        self.commit(next)
+    }
+
+    /// Blocks an active Mission because AI6 stopped it, recording `reason`.
+    ///
+    /// Blocking again with another reason replaces the reason, so a repeated stop is harmless.
+    pub fn block_for(&mut self, mission_id: &str, reason: &str) -> Result<Mission, MissionError> {
+        let mut next = self.missions.clone();
+        let mission = next.get_mut(mission_id).ok_or(MissionError::NotFound)?;
+        if mission.state != MissionState::Blocked
+            && !valid_transition(mission.state, MissionState::Blocked)
+        {
+            return Err(MissionError::InvalidTransition {
+                from: mission.state,
+                to: MissionState::Blocked,
+            });
+        }
+        mission.state = MissionState::Blocked;
+        mission.parked_until = None;
+        mission.blocked_reason = Some(reason.to_owned());
+        mission.revision += 1;
+        let updated = mission.clone();
+        self.commit(next)?;
+        Ok(updated)
+    }
+
+    /// Fails a queued Mission whose harness cannot be started, recording why. Failing it again
+    /// replaces the reason.
+    pub fn fail_for(&mut self, mission_id: &str, reason: &str) -> Result<Mission, MissionError> {
+        let mut next = self.missions.clone();
+        let mission = next.get_mut(mission_id).ok_or(MissionError::NotFound)?;
+        if mission.state != MissionState::Failed
+            && !valid_transition(mission.state, MissionState::Failed)
+        {
+            return Err(MissionError::InvalidTransition {
+                from: mission.state,
+                to: MissionState::Failed,
+            });
+        }
+        mission.state = MissionState::Failed;
+        mission.parked_until = None;
+        mission.blocked_reason = None;
+        mission.waiting = None;
+        mission.failure = Some(reason.to_owned());
+        mission.reported_failure = None;
+        mission.revision += 1;
+        let updated = mission.clone();
+        self.commit(next)?;
+        Ok(updated)
+    }
+
+    /// Fails the Mission as its harness reported, keeping what the harness said.
+    pub fn fail_reported(&mut self, mission_id: &str, said: &str) -> Result<Mission, MissionError> {
+        let mut next = self.missions.clone();
+        let mission = next.get_mut(mission_id).ok_or(MissionError::NotFound)?;
+        if !valid_transition(mission.state, MissionState::Failed) {
+            return Err(MissionError::InvalidTransition {
+                from: mission.state,
+                to: MissionState::Failed,
+            });
+        }
+        mission.state = MissionState::Failed;
+        mission.parked_until = None;
+        mission.blocked_reason = None;
+        mission.waiting = None;
+        mission.failure = None;
+        mission.reported_failure = Some(said.to_owned());
+        mission.revision += 1;
+        let updated = mission.clone();
+        self.commit(next)?;
+        Ok(updated)
+    }
+
+    /// Records that the provider could not resume the Session this attempt would have taken up,
+    /// so its next start begins a new one.
+    pub fn refuse_resume(&mut self, mission_id: &str, why: &str) -> Result<Mission, MissionError> {
+        let mut next = self.missions.clone();
+        let mission = next.get_mut(mission_id).ok_or(MissionError::NotFound)?;
+        mission.resume_refused = Some(why.to_owned());
+        mission.revision += 1;
+        let updated = mission.clone();
+        self.commit(next)?;
+        Ok(updated)
+    }
+
+    /// Holds a Mission whose Session ended done with `reason` standing in the way of `done`.
+    pub fn hold_for(&mut self, mission_id: &str, reason: &str) -> Result<Mission, MissionError> {
+        let mut next = self.missions.clone();
+        let mission = next.get_mut(mission_id).ok_or(MissionError::NotFound)?;
+        if !valid_transition(mission.state, MissionState::Held) {
+            return Err(MissionError::InvalidTransition {
+                from: mission.state,
+                to: MissionState::Held,
+            });
+        }
+        mission.state = MissionState::Held;
+        mission.parked_until = None;
+        mission.blocked_reason = Some(reason.to_owned());
+        mission.failure = None;
+        mission.reported_failure = None;
+        mission.waiting = None;
+        mission.revision += 1;
+        let updated = mission.clone();
+        self.commit(next)?;
+        Ok(updated)
+    }
+
+    /// Takes a queued Mission out of the book: its brief was filed while it waited to start, so
+    /// nothing is left for it to do. `false` for a Mission in any other state, or none.
+    pub fn forget_queued(&mut self, mission_id: &str) -> Result<bool, MissionError> {
+        if self
+            .missions
+            .get(mission_id)
+            .is_none_or(|mission| mission.state != MissionState::Queued)
+        {
+            return Ok(false);
+        }
+        let mut next = self.missions.clone();
+        next.remove(mission_id);
+        let mut operations = self.operations.clone();
+        operations.remove(mission_id);
+        self.commit_with(next, operations)?;
+        Ok(true)
+    }
+
+    /// Quarantines an active Mission: its work stops and only an operator moves it on.
+    ///
+    /// Quarantining again is harmless. Finished Missions are left alone.
+    pub fn quarantine(&mut self, mission_id: &str) -> Result<Mission, MissionError> {
+        let mut next = self.missions.clone();
+        let mission = next.get_mut(mission_id).ok_or(MissionError::NotFound)?;
+        if mission.state == MissionState::Quarantined {
+            return Ok(mission.clone());
+        }
+        if !valid_transition(mission.state, MissionState::Quarantined) {
+            return Err(MissionError::InvalidTransition {
+                from: mission.state,
+                to: MissionState::Quarantined,
+            });
+        }
+        mission.state = MissionState::Quarantined;
+        mission.parked_until = None;
+        mission.blocked_reason = None;
+        mission.revision += 1;
+        let updated = mission.clone();
+        self.commit(next)?;
+        Ok(updated)
+    }
+
+    /// Gives a queued Mission to another Agent, as when its assigned Agent is quarantined.
+    pub fn reassign(
+        &mut self,
+        mission_id: &str,
+        agent_id: String,
+    ) -> Result<Mission, MissionError> {
+        let mut next = self.missions.clone();
+        let mission = next.get_mut(mission_id).ok_or(MissionError::NotFound)?;
+        if mission.state != MissionState::Queued {
+            return Err(MissionError::InvalidTransition {
+                from: mission.state,
+                to: MissionState::Queued,
+            });
+        }
+        mission.agent_id = Some(agent_id);
+        mission.waiting = None;
+        mission.revision += 1;
+        let updated = mission.clone();
+        self.commit(next)?;
+        Ok(updated)
+    }
+
+    /// Records why a queued Mission waits (`None` clears it); `false` when that was already
+    /// recorded, so a caller tells of each new reason once.
+    pub fn set_waiting(
+        &mut self,
+        mission_id: &str,
+        reason: Option<String>,
+    ) -> Result<bool, MissionError> {
+        let mut next = self.missions.clone();
+        let mission = next.get_mut(mission_id).ok_or(MissionError::NotFound)?;
+        if mission.waiting == reason {
+            return Ok(false);
+        }
+        mission.waiting = reason;
+        mission.revision += 1;
+        self.commit(next)?;
+        Ok(true)
+    }
+
+    /// Lists parked Missions whose resume time is `now` or earlier, in identity order.
+    pub fn due_parked(&self, now: i64) -> Vec<Mission> {
+        self.missions
+            .values()
+            .filter(|mission| {
+                mission.state == MissionState::Parked
+                    && mission.parked_until.is_some_and(|until| until <= now)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Hands an interrupted Mission to another Agent as a new attempt: it is queued again
+    /// with `agent_id` assigned and keeps its Sessions and safe house.
+    pub fn requeue_for(
+        &mut self,
+        mission_id: &str,
+        agent_id: String,
+    ) -> Result<Mission, MissionError> {
+        let mut next = self.missions.clone();
+        let mission = next.get_mut(mission_id).ok_or(MissionError::NotFound)?;
+        if !matches!(
+            mission.state,
+            MissionState::Working
+                | MissionState::Blocked
+                | MissionState::Stalled
+                | MissionState::Parked
+                | MissionState::Quarantined
+        ) {
+            return Err(MissionError::InvalidTransition {
+                from: mission.state,
+                to: MissionState::Queued,
+            });
+        }
+        mission.state = MissionState::Queued;
+        mission.parked_until = None;
+        mission.blocked_reason = None;
+        mission.waiting = None;
+        mission.agent_id = Some(agent_id);
+        mission.revision += 1;
+        let updated = mission.clone();
+        self.commit(next)?;
+        Ok(updated)
+    }
+
+    /// Queues a stalled or finished Mission again as a new attempt, for `agent_id` when
+    /// given and otherwise for the Agent it had. It keeps its Sessions and safe house, so the
+    /// next attempt continues the work; a quarantined Mission waits for its release instead.
+    pub fn retry(
+        &mut self,
+        mission_id: &str,
+        agent_id: Option<String>,
+    ) -> Result<Mission, MissionError> {
+        let mut next = self.missions.clone();
+        let mission = next.get_mut(mission_id).ok_or(MissionError::NotFound)?;
+        if !matches!(
+            mission.state,
+            MissionState::Stalled
+                | MissionState::Done
+                | MissionState::Failed
+                | MissionState::Blown
+                | MissionState::Abandoned
+        ) {
+            return Err(MissionError::InvalidTransition {
+                from: mission.state,
+                to: MissionState::Queued,
+            });
+        }
+        mission.state = MissionState::Queued;
+        mission.parked_until = None;
+        mission.blocked_reason = None;
+        mission.failure = None;
+        mission.reported_failure = None;
+        if agent_id.is_some() {
+            mission.agent_id = agent_id;
+        }
+        mission.revision += 1;
+        let updated = mission.clone();
+        self.commit(next)?;
+        Ok(updated)
+    }
+
+    /// [`retry`](Self::retry) on this Station's word rather than from a brief: it starts whatever
+    /// the Registry has filed that brief as.
+    pub fn retry_past_brief(
+        &mut self,
+        mission_id: &str,
+        agent_id: Option<String>,
+    ) -> Result<Mission, MissionError> {
+        self.retry(mission_id, agent_id)?;
+        let mut next = self.missions.clone();
+        let mission = next.get_mut(mission_id).ok_or(MissionError::NotFound)?;
+        mission.runs_past_brief = true;
+        mission.revision += 1;
+        let updated = mission.clone();
+        self.commit(next)?;
+        Ok(updated)
+    }
+
+    /// Records the content digest of the Registry brief this Station runs the Mission from.
+    pub fn record_brief_digest(
+        &mut self,
+        mission_id: &str,
+        digest: &str,
+    ) -> Result<Mission, MissionError> {
+        let mut next = self.missions.clone();
+        let mission = next.get_mut(mission_id).ok_or(MissionError::NotFound)?;
+        if mission.brief_digest.as_deref() == Some(digest) {
+            return Ok(mission.clone());
+        }
+        mission.brief_digest = Some(digest.to_owned());
+        mission.revision += 1;
+        let updated = mission.clone();
+        self.commit(next)?;
+        Ok(updated)
+    }
+
+    /// Queues a Mission that ended as its next attempt, from another brief (its `digest`), which
+    /// may say more than the last (`prompt`): an item's new comments, a Sleeper's next window. Unlike
+    /// [`retry`](Self::retry), the attempt does not continue an interrupted one: this Station's
+    /// hold on the last Session is let go, and the next start records a new one after it.
+    pub fn reopen(
+        &mut self,
+        mission_id: &str,
+        agent_id: String,
+        prompt: String,
+        digest: &str,
+    ) -> Result<Mission, MissionError> {
+        if prompt.trim().is_empty() {
+            return Err(MissionError::EmptyPrompt);
+        }
+        let mut next = self.missions.clone();
+        let mission = next.get_mut(mission_id).ok_or(MissionError::NotFound)?;
+        if !matches!(
+            mission.state,
+            MissionState::Done
+                | MissionState::Failed
+                | MissionState::Blown
+                | MissionState::Abandoned
+        ) {
+            return Err(MissionError::InvalidTransition {
+                from: mission.state,
+                to: MissionState::Queued,
+            });
+        }
+        mission.after_failure = matches!(mission.state, MissionState::Failed | MissionState::Blown);
+        mission.state = MissionState::Queued;
+        mission.prompt = prompt;
+        mission.agent_id = Some(agent_id);
+        mission.brief_digest = Some(digest.to_owned());
+        mission.parked_until = None;
+        mission.blocked_reason = None;
+        mission.failure = None;
+        mission.reported_failure = None;
+        mission.resume_refused = None;
+        mission.runs_past_brief = false;
+        mission.waiting = None;
+        mission.denied_tools.clear();
+        mission.revision += 1;
+        let updated = mission.clone();
+        let mut operations = self.operations.clone();
+        if let Some(manifest) = operations.get_mut(mission_id) {
+            manifest.session = None;
+            manifest.runner = None;
+        }
+        self.commit_with(next, operations)?;
+        Ok(updated)
+    }
+
+    /// Queues a Mission that is verifying as its next attempt for `agent_id`, told `amendment` after
+    /// its brief. The attempt starts a new provider Session and, like a failed one, does not take
+    /// up the last one; the safe house the last attempt kept stays.
+    pub fn redispatch(
+        &mut self,
+        mission_id: &str,
+        agent_id: String,
+        amendment: String,
+    ) -> Result<Mission, MissionError> {
+        if amendment.trim().is_empty() {
+            return Err(MissionError::EmptyPrompt);
+        }
+        let mut next = self.missions.clone();
+        let mission = next.get_mut(mission_id).ok_or(MissionError::NotFound)?;
+        if mission.state != MissionState::Verifying {
+            return Err(MissionError::InvalidTransition {
+                from: mission.state,
+                to: MissionState::Queued,
+            });
+        }
+        mission.state = MissionState::Queued;
+        mission.after_failure = true;
+        mission.agent_id = Some(agent_id);
+        mission.amendments.push(amendment);
+        mission.parked_until = None;
+        mission.blocked_reason = None;
+        mission.failure = None;
+        mission.reported_failure = None;
+        mission.resume_refused = None;
+        mission.waiting = None;
+        mission.denied_tools.clear();
+        mission.revision += 1;
+        let updated = mission.clone();
+        let mut operations = self.operations.clone();
+        if let Some(manifest) = operations.get_mut(mission_id) {
+            manifest.session = None;
+            manifest.runner = None;
+        }
+        self.commit_with(next, operations)?;
+        Ok(updated)
+    }
+
+    /// Associates a provider-issued Session ID with the Mission that operation serves.
+    pub fn attach_session(
+        &mut self,
+        mission_id: &str,
+        session_id: SessionId,
+    ) -> Result<Mission, MissionError> {
+        let mut next = self.missions.clone();
+        let mission = next.get_mut(mission_id).ok_or(MissionError::NotFound)?;
+        if matches!(
+            mission.state,
+            MissionState::Done
+                | MissionState::Failed
+                | MissionState::Blown
+                | MissionState::Abandoned
+        ) {
+            return Err(MissionError::TerminalMission);
+        }
+        if mission.session_ids.contains(&session_id) {
+            return Err(MissionError::SessionAlreadyAttached);
+        }
+        mission.session_ids.push(session_id);
+        mission.revision += 1;
+        let updated = mission.clone();
+        self.commit(next)?;
+        Ok(updated)
+    }
+
+    /// Records the worktree created for this Mission or its final cleanup report.
+    pub fn set_safe_house(
+        &mut self,
+        mission_id: &str,
+        report: SafeHouseReport,
+    ) -> Result<Mission, MissionError> {
+        let mut next = self.missions.clone();
+        let mission = next.get_mut(mission_id).ok_or(MissionError::NotFound)?;
+        mission.safe_house = Some(report);
+        mission.revision += 1;
+        let updated = mission.clone();
+        self.commit(next)?;
+        Ok(updated)
+    }
+
+    /// Records the result of auditing commits against the Operation's cover policy.
+    pub fn set_cover_report(
+        &mut self,
+        mission_id: &str,
+        report: CoverReport,
+    ) -> Result<Mission, MissionError> {
+        let mut next = self.missions.clone();
+        let mission = next.get_mut(mission_id).ok_or(MissionError::NotFound)?;
+        mission.cover = Some(report);
+        mission.revision += 1;
+        let updated = mission.clone();
+        self.commit(next)?;
+        Ok(updated)
+    }
+
+    fn commit(&mut self, next: BTreeMap<String, Mission>) -> Result<(), MissionError> {
+        self.commit_with(next, self.operations.clone())
+    }
+
+    fn commit_with(
+        &mut self,
+        missions: BTreeMap<String, Mission>,
+        operations: BTreeMap<String, LaunchManifest>,
+    ) -> Result<(), MissionError> {
+        self.persist(&missions, &operations)
+            .map_err(|_| MissionError::Persistence)?;
+        self.missions = missions;
+        self.operations = operations;
+        Ok(())
+    }
+
+    fn persist(
+        &self,
+        missions: &BTreeMap<String, Mission>,
+        operations: &BTreeMap<String, LaunchManifest>,
+    ) -> io::Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let bytes = serde_json::to_vec(&MissionSnapshot {
+            version: 1,
+            missions: missions.clone(),
+            operations: operations.clone(),
+        })
+        .map_err(io::Error::other)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        temporary.write_all(&bytes)?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(path).map_err(|error| error.error)?;
+        Ok(())
+    }
+}
+
+/// Whether `path` is absolute on the Station or on a Theater, which may run another OS: a
+/// POSIX `/…` path or a Windows drive path.
+pub(crate) fn is_absolute_anywhere(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    Path::new(path).is_absolute()
+        || path.starts_with('/')
+        || (bytes.len() > 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'))
+}
+
+/// A rejected Mission operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissionError {
+    /// A Mission with this ID already exists.
+    AlreadyExists,
+    /// A Mission needs a non-empty prompt.
+    EmptyPrompt,
+    /// The requested Mission does not exist.
+    NotFound,
+    /// The requested state change is not allowed.
+    InvalidTransition {
+        from: MissionState,
+        to: MissionState,
+    },
+    /// A terminal Mission cannot accept new Sessions.
+    TerminalMission,
+    /// The provider Session ID is already attached to this Mission.
+    SessionAlreadyAttached,
+    /// The durable Mission snapshot could not be written.
+    Persistence,
+    /// Persisted AgentHandler execution settings are incomplete.
+    InvalidOperation,
+}
+
+fn valid_transition(from: MissionState, to: MissionState) -> bool {
+    use MissionState::{
+        Abandoned, Blocked, Blown, Done, Failed, Held, Parked, Quarantined, Queued, Stalled,
+        Verifying, Working,
+    };
+    matches!(
+        (from, to),
+        (Queued, Working | Failed | Abandoned)
+            | (
+                Working,
+                Blocked | Stalled | Done | Failed | Abandoned | Held | Verifying
+            )
+            | (Held | Verifying, Done | Failed | Abandoned)
+            | (Blocked, Stalled | Working | Failed | Abandoned)
+            | (Working, Blown)
+            | (Blocked, Blown)
+            | (Stalled, Working | Failed | Blown | Abandoned)
+            | (Parked, Working | Failed | Abandoned)
+            | (Working | Blocked | Stalled | Parked, Quarantined)
+            | (Quarantined, Abandoned)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn book() -> MissionStore {
+        MissionStore::default()
+    }
+
+    #[test]
+    fn a_working_directory_on_a_theater_of_another_os_is_absolute() {
+        for path in ["/srv/work", "C:\\work", "c:/work"] {
+            assert!(is_absolute_anywhere(path), "{path}");
+        }
+        for path in ["work", "./work", "C:work", ""] {
+            assert!(!is_absolute_anywhere(path), "{path}");
+        }
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn a_launch_on_a_posix_theater_reopens_on_any_station() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missions.json");
+        let mut book = MissionStore::open(&path).unwrap();
+        book.create(
+            MissionId::try_new("mission-1").unwrap(),
+            None,
+            "work over there".to_owned(),
+            None,
+            None,
+        )
+        .unwrap();
+        book.set_operation(
+            "mission-1",
+            LaunchManifest {
+                pool: None,
+                handler_provider: "claude".to_owned(),
+                terminal_provider: "detached".to_owned(),
+                working_directory: "/srv/work".to_owned(),
+                model: None,
+                effort: None,
+                cover: None,
+                station_id: None,
+                theater_id: Some("box".to_owned()),
+                mode: ExecutionMode::Field,
+                session: None,
+                runner: Some("key-1".to_owned()),
+                clearance: None,
+                overlays: Vec::new(),
+            },
+        )
+        .unwrap();
+        drop(book);
+        let book = MissionStore::open(&path).unwrap();
+        let manifest = book.operation("mission-1").unwrap();
+        assert_eq!(manifest.working_directory, "/srv/work");
+        assert_eq!(manifest.runner.as_deref(), Some("key-1"));
+    }
+
+    #[test]
+    fn denied_tools_last_until_the_mission_works_again() {
+        let mut missions = MissionStore::default();
+        let id = MissionId::try_new("mission-denied").unwrap();
+        missions
+            .create(id.clone(), None, "work".to_owned(), None, None)
+            .unwrap();
+        missions
+            .transition(id.as_str(), MissionState::Working)
+            .unwrap();
+        let tools = vec!["Write".to_owned(), "Bash".to_owned()];
+        missions
+            .note_denied_tools(id.as_str(), tools.clone())
+            .unwrap();
+        let blocked = missions
+            .transition(id.as_str(), MissionState::Blocked)
+            .unwrap();
+        assert_eq!(blocked.denied_tools, tools, "a wait keeps them");
+        let working = missions
+            .transition(id.as_str(), MissionState::Working)
+            .unwrap();
+        assert!(working.denied_tools.is_empty());
+        missions
+            .note_denied_tools(id.as_str(), tools.clone())
+            .unwrap();
+        let done = missions
+            .transition(id.as_str(), MissionState::Done)
+            .unwrap();
+        assert_eq!(done.denied_tools, tools, "the end keeps them");
+    }
+
+    #[test]
+    fn a_mission_groups_provider_sessions_and_preserves_identity() {
+        let mut book = book();
+        let mission = book
+            .create(
+                MissionId::try_new("mission-1").unwrap(),
+                Some("operation-a".to_owned()),
+                "inspect the service".to_owned(),
+                Some("007".to_owned()),
+                None,
+            )
+            .unwrap();
+        assert_eq!(mission.revision, 1);
+        assert_eq!(mission.state, MissionState::Queued);
+
+        book.transition("mission-1", MissionState::Working).unwrap();
+        let session = SessionId::try_new("provider-session-abc").unwrap();
+        book.attach_session("mission-1", session.clone()).unwrap();
+        let mission = book.transition("mission-1", MissionState::Blocked).unwrap();
+        let resumed = book.transition("mission-1", MissionState::Working).unwrap();
+
+        assert_eq!(mission.revision, 4);
+        assert_eq!(resumed.revision, 5);
+        assert_eq!(resumed.session_ids, [session]);
+    }
+
+    #[test]
+    fn terminal_missions_reject_new_sessions_and_state_changes() {
+        let mut book = book();
+        book.create(
+            MissionId::try_new("mission-1").unwrap(),
+            None,
+            "inspect the service".to_owned(),
+            None,
+            None,
+        )
+        .unwrap();
+        book.transition("mission-1", MissionState::Failed).unwrap();
+
+        assert_eq!(
+            book.transition("mission-1", MissionState::Working),
+            Err(MissionError::InvalidTransition {
+                from: MissionState::Failed,
+                to: MissionState::Working,
+            })
+        );
+        assert_eq!(
+            book.attach_session("mission-1", SessionId::try_new("session-1").unwrap()),
+            Err(MissionError::TerminalMission)
+        );
+    }
+
+    #[test]
+    fn a_blocked_mission_can_be_marked_stalled_by_the_watchdog() {
+        let mut book = book();
+        book.create(
+            MissionId::try_new("mission-blocked-watchdog").unwrap(),
+            None,
+            "waiting for input".to_owned(),
+            Some("007".to_owned()),
+            None,
+        )
+        .unwrap();
+        book.transition("mission-blocked-watchdog", MissionState::Working)
+            .unwrap();
+        book.transition("mission-blocked-watchdog", MissionState::Blocked)
+            .unwrap();
+
+        let stalled = book
+            .transition("mission-blocked-watchdog", MissionState::Stalled)
+            .unwrap();
+
+        assert_eq!(stalled.state, MissionState::Stalled);
+    }
+
+    #[test]
+    fn repeating_the_current_state_does_not_change_the_revision() {
+        let mut book = book();
+        let created = book
+            .create(
+                MissionId::try_new("mission-idempotent").unwrap(),
+                None,
+                "inspect the service".to_owned(),
+                None,
+                None,
+            )
+            .unwrap();
+        let repeated = book
+            .transition("mission-idempotent", MissionState::Queued)
+            .unwrap();
+
+        assert_eq!(repeated, created);
+    }
+
+    #[test]
+    fn a_mission_can_finish_with_a_blown_cover_report() {
+        let mut book = book();
+        book.create(
+            MissionId::try_new("mission-cover").unwrap(),
+            Some("operation-g".to_owned()),
+            "update the service".to_owned(),
+            Some("007".to_owned()),
+            None,
+        )
+        .unwrap();
+        book.transition("mission-cover", MissionState::Working)
+            .unwrap();
+        let report = CoverReport {
+            policy: "covert".to_owned(),
+            commits: 1,
+            checkable: true,
+            blown: true,
+            violations: vec![crate::directorates::m::cover::CoverViolation {
+                commit: "abcdef123456".to_owned(),
+                rule: "trailer".to_owned(),
+                detail: "Co-Authored-By: Agent <agent@example.invalid>".to_owned(),
+            }],
+        };
+        book.set_cover_report("mission-cover", report.clone())
+            .unwrap();
+        let blown = book
+            .transition("mission-cover", MissionState::Blown)
+            .unwrap();
+
+        assert_eq!(blown.state, MissionState::Blown);
+        assert_eq!(blown.cover, Some(report));
+    }
+
+    #[test]
+    fn durable_book_reopens_mission_state_and_provider_sessions() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missions.json");
+        {
+            let mut book = MissionStore::open(&path).unwrap();
+            book.create(
+                MissionId::try_new("mission-1").unwrap(),
+                Some("operation-a".to_owned()),
+                "inspect the service".to_owned(),
+                Some("007".to_owned()),
+                Some("case-officer".to_owned()),
+            )
+            .unwrap();
+            book.transition("mission-1", MissionState::Working).unwrap();
+            book.attach_session(
+                "mission-1",
+                SessionId::try_new("provider-session-9").unwrap(),
+            )
+            .unwrap();
+            book.set_operation(
+                "mission-1",
+                LaunchManifest {
+                    pool: None,
+                    handler_provider: "claude".to_owned(),
+                    terminal_provider: "pty".to_owned(),
+                    working_directory: directory.path().to_string_lossy().into_owned(),
+                    model: Some("sonnet".to_owned()),
+                    effort: Some("high".to_owned()),
+                    cover: None,
+                    station_id: Some("hq".to_owned()),
+                    theater_id: Some("local".to_owned()),
+                    mode: ExecutionMode::Field,
+                    session: None,
+                    runner: None,
+                    clearance: None,
+                    overlays: Vec::new(),
+                },
+            )
+            .unwrap();
+        }
+
+        let mut reopened = MissionStore::open(path).unwrap();
+        let manifest = reopened.operation("mission-1").unwrap();
+        assert_eq!(manifest.station_id.as_deref(), Some("hq"));
+        assert_eq!(manifest.theater_id.as_deref(), Some("local"));
+        let mission = reopened.get("mission-1").unwrap();
+        assert_eq!(mission.state, MissionState::Working);
+        assert_eq!(mission.role_id.as_deref(), Some("case-officer"));
+        assert_eq!(mission.session_ids[0].as_str(), "provider-session-9");
+        assert_eq!(mission.revision, 3);
+        assert_eq!(
+            reopened.operation("mission-1").unwrap().handler_provider,
+            "claude"
+        );
+        assert_eq!(reopened.recover_working().unwrap(), 1);
+        assert_eq!(
+            reopened.get("mission-1").unwrap().state,
+            MissionState::Blocked
+        );
+        assert_eq!(reopened.get("mission-1").unwrap().revision, 4);
+        assert_eq!(reopened.recover_working().unwrap(), 0);
+    }
+
+    #[test]
+    fn launch_records_written_before_placement_still_load() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missions.json");
+        {
+            let mut book = MissionStore::open(&path).unwrap();
+            book.create(
+                MissionId::try_new("old-1").unwrap(),
+                None,
+                "inspect".to_owned(),
+                None,
+                None,
+            )
+            .unwrap();
+            book.set_operation(
+                "old-1",
+                LaunchManifest {
+                    pool: None,
+                    handler_provider: "claude".to_owned(),
+                    terminal_provider: "pty".to_owned(),
+                    working_directory: directory.path().to_string_lossy().into_owned(),
+                    model: None,
+                    effort: None,
+                    cover: None,
+                    station_id: Some("hq".to_owned()),
+                    theater_id: Some("local".to_owned()),
+                    mode: ExecutionMode::Field,
+                    session: None,
+                    runner: None,
+                    clearance: None,
+                    overlays: Vec::new(),
+                },
+            )
+            .unwrap();
+        }
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let manifest = snapshot["operations"]["old-1"].as_object_mut().unwrap();
+        manifest.remove("station_id").unwrap();
+        manifest.remove("theater_id").unwrap();
+        manifest.remove("session").unwrap();
+        fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+
+        let reopened = MissionStore::open(&path).unwrap();
+        let manifest = reopened.operation("old-1").unwrap();
+        assert_eq!(manifest.station_id, None);
+        assert_eq!(manifest.theater_id, None);
+        assert_eq!(manifest.session, None);
+    }
+
+    fn working_mission(book: &mut MissionStore, id: &str) {
+        book.create(
+            MissionId::try_new(id).unwrap(),
+            Some("operation-a".to_owned()),
+            "inspect".to_owned(),
+            Some("007".to_owned()),
+            None,
+        )
+        .unwrap();
+        book.transition(id, MissionState::Working).unwrap();
+    }
+
+    #[test]
+    fn a_parked_mission_is_due_only_once_its_time_has_passed() {
+        let mut book = book();
+        working_mission(&mut book, "parked-1");
+        working_mission(&mut book, "parked-2");
+        book.park("parked-1", 1_000).unwrap();
+        book.park("parked-2", 2_000).unwrap();
+
+        assert!(book.due_parked(999).is_empty());
+        assert_eq!(book.due_parked(1_000).len(), 1);
+        let ids: Vec<_> = book
+            .due_parked(2_000)
+            .iter()
+            .map(|mission| mission.mission_id.to_string())
+            .collect();
+        assert_eq!(ids, ["parked-1", "parked-2"]);
+
+        // Resuming clears the time; parking only applies to an active Mission.
+        let resumed = book.transition("parked-1", MissionState::Working).unwrap();
+        assert_eq!(
+            (resumed.state, resumed.parked_until),
+            (MissionState::Working, None)
+        );
+        book.transition("parked-1", MissionState::Failed).unwrap();
+        assert!(matches!(
+            book.park("parked-1", 5),
+            Err(MissionError::InvalidTransition { .. })
+        ));
+        // Parking is not an ordinary transition: it needs a resume time.
+        working_mission(&mut book, "parked-4");
+        assert!(matches!(
+            book.transition("parked-4", MissionState::Parked),
+            Err(MissionError::InvalidTransition { .. })
+        ));
+    }
+
+    #[test]
+    fn parking_again_moves_the_resume_time_and_requeueing_clears_it() {
+        let mut book = book();
+        working_mission(&mut book, "parked-3");
+        book.park("parked-3", 100).unwrap();
+        let moved = book.park("parked-3", 900).unwrap();
+        assert_eq!(moved.parked_until, Some(900));
+
+        let handed_off = book.requeue_for("parked-3", "008".to_owned()).unwrap();
+        assert_eq!(handed_off.state, MissionState::Queued);
+        assert_eq!(handed_off.agent_id.as_deref(), Some("008"));
+        assert_eq!(handed_off.parked_until, None);
+        assert!(book.due_parked(i64::MAX).is_empty());
+    }
+
+    #[test]
+    fn a_retry_queues_a_stalled_or_finished_mission_and_keeps_its_sessions() {
+        let mut book = book();
+        working_mission(&mut book, "retry-1");
+        let session = SessionId::try_new("provider-session-1").unwrap();
+        book.attach_session("retry-1", session.clone()).unwrap();
+        book.transition("retry-1", MissionState::Failed).unwrap();
+
+        let retried = book.retry("retry-1", None).unwrap();
+        assert_eq!(retried.state, MissionState::Queued);
+        assert_eq!(retried.agent_id.as_deref(), Some("007"));
+        assert_eq!(retried.session_ids, [session]);
+
+        book.transition("retry-1", MissionState::Working).unwrap();
+        book.transition("retry-1", MissionState::Stalled).unwrap();
+        let handed = book.retry("retry-1", Some("008".to_owned())).unwrap();
+        assert_eq!(handed.agent_id.as_deref(), Some("008"));
+
+        // Queued, live, parked and quarantined work is not retried.
+        assert!(matches!(
+            book.retry("retry-1", None),
+            Err(MissionError::InvalidTransition { .. })
+        ));
+        working_mission(&mut book, "retry-2");
+        assert!(book.retry("retry-2", None).is_err());
+        book.park("retry-2", 10).unwrap();
+        assert!(book.retry("retry-2", None).is_err());
+        book.quarantine("retry-2").unwrap();
+        assert!(book.retry("retry-2", None).is_err());
+    }
+
+    #[test]
+    fn missions_written_before_parking_still_load() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missions.json");
+        {
+            let mut book = MissionStore::open(&path).unwrap();
+            working_mission(&mut book, "old-2");
+        }
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mission = snapshot["missions"]["old-2"].as_object_mut().unwrap();
+        mission.remove("parked_until").unwrap();
+        fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+
+        let reopened = MissionStore::open(&path).unwrap();
+        assert_eq!(reopened.get("old-2").unwrap().parked_until, None);
+    }
+
+    #[test]
+    fn a_session_hold_survives_a_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missions.json");
+        {
+            let mut book = MissionStore::open(&path).unwrap();
+            book.create(
+                MissionId::try_new("held-1").unwrap(),
+                None,
+                "inspect".to_owned(),
+                None,
+                None,
+            )
+            .unwrap();
+            book.set_operation(
+                "held-1",
+                LaunchManifest {
+                    pool: None,
+                    handler_provider: "claude".to_owned(),
+                    terminal_provider: "pty".to_owned(),
+                    working_directory: directory.path().to_string_lossy().into_owned(),
+                    model: None,
+                    effort: None,
+                    cover: None,
+                    station_id: Some("hq".to_owned()),
+                    theater_id: Some("local".to_owned()),
+                    mode: ExecutionMode::Field,
+                    session: None,
+                    runner: None,
+                    clearance: None,
+                    overlays: Vec::new(),
+                },
+            )
+            .unwrap();
+            book.set_hold(
+                "held-1",
+                SessionHold {
+                    id: "s-1".to_owned(),
+                    attempt: 2,
+                    fence: 7,
+                },
+            )
+            .unwrap();
+        }
+        let reopened = MissionStore::open(&path).unwrap();
+        let hold = reopened.operation("held-1").unwrap().session.unwrap();
+        assert_eq!((hold.id.as_str(), hold.attempt, hold.fence), ("s-1", 2, 7));
+    }
+}

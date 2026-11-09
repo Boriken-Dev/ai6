@@ -1,0 +1,198 @@
+![AI6](docs/assets/ai6-header.png)
+
+# AI6
+
+[![Version](https://img.shields.io/badge/version-0.1.0--dev-blue.svg)](https://github.com/jose-pr/ai6/blob/main/CHANGELOG.md#unreleased)
+[![Rust version](https://img.shields.io/badge/rust-1.89%2B-blue.svg)](https://github.com/jose-pr/ai6/blob/main/Cargo.toml)
+[![License: MPL-2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](https://github.com/jose-pr/ai6/blob/main/LICENSE)
+[![Docs](https://img.shields.io/badge/docs-latest-blue.svg)](https://jose-pr.github.io/ai6/)
+[![CI](https://img.shields.io/github/actions/workflow/status/jose-pr/ai6/test.yml)](https://github.com/jose-pr/ai6/actions/workflows/test.yml)
+
+AI6 is a self-hosted control plane for coding agents. **Register your projects as
+Operations, hand AI6 Missions, and its Stations post an Agent to each one and run it as
+a Claude Code or Codex Session in its own Git worktree, under a watchdog** — while
+operators follow and steer the work from Outer Office, the operator app. Read the
+[documentation](https://jose-pr.github.io/ai6/).
+
+## Features
+
+- **Stations** - each node runs the `ai6` daemon: it leases Missions from a shared
+  Registry, posts the best available Agent, and reattaches to running Sessions after a
+  restart. Control Stations elect a Headquarters Station.
+- **Agents and roles** - an Agent is a codename that owns its harness, model and effort;
+  roles describe the job. When an Agent's harness is unavailable, the next qualified Agent
+  is its backup.
+- **Safe houses** - every Mission gets an isolated Git worktree; its commits are audited
+  against the Operation's cover policy.
+- **Cables** - permission-scoped agent-to-agent messages through per-Session MCP tools.
+- **Universal Exports** - the authenticated public API: pluggable authentication and
+  directories, per-Operation authorization, read-first terminal attachment, audit.
+- **Outer Office** - the Flutter desktop and web operator app, where Moneypenny, the AI
+  assistant, answers; `ai6ctl` for the terminal.
+- **Cross-platform terminal** - the `pty` provider uses openpty on Unix and ConPTY with
+  Job Objects on Windows.
+
+## Installation
+
+AI6 is built from source (Rust 1.89 or later):
+
+```bash
+git clone https://github.com/jose-pr/ai6.git
+cd ai6
+cargo build --workspace --all-features
+```
+
+Outer Office needs the Flutter `main` SDK; see
+[its README](https://github.com/jose-pr/ai6/blob/main/clients/outer-office/README.md).
+[`tools/sdk/bootstrap.sh`](https://github.com/jose-pr/ai6/blob/main/tools/sdk/README.md) installs
+every SDK a build needs, at the versions the repository is tested with.
+
+## Quick start
+
+`examples/config` registers Operation `G` (this repository) and Agents `007`, its backup
+`008`, and `Tanner`. Start a Station with it; the Claude handler needs Claude Code on
+`PATH`:
+
+```bash
+cargo run -p ai6 --features cli -- serve --config ./examples/config/ai6.cfg
+```
+
+Submit a Mission to the Station's private API from another terminal, with the token the
+Station keeps in `api-token` under its state directory (`state_dir` in `ai6.cfg`, else
+`%LOCALAPPDATA%\AI6` on Windows, or `$XDG_STATE_HOME/AI6`, by default `~/.local/state/AI6`):
+
+```bash
+curl -f -X POST http://127.0.0.1:7081/internal/missions \
+  -H "authorization: Bearer $(cat ~/.local/state/AI6/api-token)" \
+  -H 'content-type: application/json' \
+  -d '{"mission_id":"mission-quickstart","operation_id":"G","prompt":"Summarize README.md","role":"case-officer"}'
+```
+
+For a clickable board with sample data and no gateway, run the Outer Office web preview
+from `clients/outer-office`:
+
+```bash
+flutter run -d web-server --web-hostname 127.0.0.1 --web-port 7357 --release \
+  --dart-define=OO_DEMO=true
+```
+
+## Command line
+
+```text
+ai6 serve [--config PATH] [--provider LOCATION] [--registry LOCATION] [--state-dir PATH]
+          [--station ID] [--listen ADDRESS] [--plugin-path PATH]...
+          [--plugin-profile strict|report|off]
+ai6 config path|show|import|export [--config PATH]
+ai6 plugins keygen --out PATH
+ai6 plugins sign --key PATH FILE...
+ai6 plugins pin [--publisher KEY] [--import [--scope station:ID] [--config PATH]] FILE...
+ai6 plugins check [--config PATH] [PATH...]
+ai6 harness pin DIR
+ai6 identity
+ai6 peer waiting
+ai6 peer accept FINGERPRINT
+
+universal-exports [--config PATH] [--provider LOCATION] [--registry LOCATION]
+          [--listen ADDRESS] [--public-origin HTTPS_ORIGIN] [--plugin-path PATH]...
+
+ai6ctl health
+ai6ctl stations
+ai6ctl station STATION_ID
+ai6ctl agent-roles --operation OPERATION
+ai6ctl missions [--operation OPERATION]
+ai6ctl mission MISSION_ID [--operation OPERATION]
+ai6ctl mission cancel|retry|resume MISSION_ID [--operation OPERATION]
+ai6ctl sessions [--operation OPERATION] [--mission MISSION_ID] [--state STATE]
+ai6ctl session SESSION_ID
+ai6ctl session interrupt SESSION_ID
+```
+
+Every program reads what it needs before it reaches its configuration provider from one
+bootstrap file, `ai6.cfg` (`--config`, else `AI6_CONFIG`, else the user's then the system's
+configuration directory), each taking its own sections. Everything else is a record of the configuration provider every Station
+reads ([Configuration](https://jose-pr.github.io/ai6/configuration/)). `ai6ctl` reads
+`--server`, else `UNEX_URL`, else `ai6.cfg`'s `[unex] url` for the Universal Exports origin,
+and a user bearer from `UNEX_ACCESS_TOKEN`. A Station publishes to Universal Exports when
+`ai6.cfg` has `[unex] url` and `token`.
+
+## API overview
+
+| Crate or module | Purpose |
+| --- | --- |
+| `ai6::directorates::m` | Roster (Operations, Agents, roles), Missions, identities, cover, access kinds |
+| `ai6::directorates::registry` | The Registry (briefs, leases, check-ins, audit) and the Cable relay |
+| `ai6::directorates::q` | Terminals, loadouts, secret leases, MCP config, sandbox arguments |
+| `ai6::directorates::section_00` | The AgentHandler contract |
+| `ai6::directorates::medical` | The Session watchdog |
+| `ai6::station` | The Station: server, provider host, safe houses, publisher, mTLS identity |
+| `universal-exports` | The public API gateway: authentication, authorization, attachment, audit |
+| `ai6-diptel` | The wire contract for Session lifecycle and terminal frames |
+| `ai6-agent-claude`, `ai6-agent-codex`, `ai6-agent-antigravity`, `ai6-agent-acp` | AgentHandler providers (`acp` runs any Agent Client Protocol agent) |
+| `ai6-terminal-pty` | The `pty` terminal provider |
+| `ai6-terminal-pipe` | The `pipe` terminal provider, for harnesses that speak JSON |
+| `coqui-access`, `coqui-roles` (shared) | Access kinds, the role authorizer and the access providers AI6 loads |
+| `coqui-peer-tls` (shared) | Station mutual TLS |
+
+## Architecture
+
+The work and the infrastructure are separate shapes:
+
+```text
+Work            Operation ──► Mission ──► Session   (provider-issued Session ID)
+Infrastructure  Station ──────────────────► Theater   (where the Session runs)
+```
+
+An **Operation** is a global project and its policy; Stations serve it, none owns it. A
+**Mission** is one brief; a **Session** is one resumable provider run. A **Station** is a
+node running `ai6 serve`; a **Theater** is the host a Session works on, reached through a
+transport (`local`, `ssh`). The directorates (M, the Registry, Q Branch, 00 Section, Medical) decide; the
+Station runs their decisions; Universal Exports is the only public door. See
+[Architecture](https://jose-pr.github.io/ai6/architecture/) and
+[Organization](https://jose-pr.github.io/ai6/organization/). Field mode on a remote Theater is
+not implemented yet.
+
+```toml
+[operation.G]
+name = "AI6"
+path = "."
+roster = ["007", "008", "Tanner"]
+
+[agent.007]
+handler = "claude"
+model = "sonnet"
+effort = "high"
+roles = ["case-officer", "analyst"]
+priority = 20
+
+[role.case-officer]
+purpose = "Own a bounded Mission and coordinate its delivery within the Operation."
+policy = "Follow the Mission brief and Operation rules; request authorization for restricted actions."
+```
+
+## Development
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy -p ai6 --no-default-features -- -D warnings
+cargo test --workspace --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+pwsh -File tools/public-api.ps1 -Mode check
+
+cd clients/outer-office
+flutter analyze --fatal-infos
+flutter test
+```
+
+The [test workflow](https://github.com/jose-pr/ai6/blob/main/.github/workflows/test.yml)
+runs these on Linux, macOS and Windows with stable Rust and 1.89.
+
+### Releasing
+
+A `v*` tag runs the test matrix and a strict documentation build, then creates a source
+release from the tagged revision and dispatches the documentation workflow. A `ci-*` tag
+runs the tests without publishing.
+
+## License
+
+Mozilla Public License 2.0. See [LICENSE](https://github.com/jose-pr/ai6/blob/main/LICENSE).

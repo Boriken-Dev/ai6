@@ -1,0 +1,492 @@
+pub mod universal_exports
+pub mod universal_exports::liaison
+pub use universal_exports::liaison::LIAISON_PREFIX
+pub use universal_exports::liaison::LIAISON_STATION
+pub enum universal_exports::liaison::Addressee
+pub universal_exports::liaison::Addressee::Agent
+pub universal_exports::liaison::Addressee::Agent::agent: alloc::string::String
+pub universal_exports::liaison::Addressee::Agent::operation: alloc::string::String
+pub universal_exports::liaison::Addressee::Role
+pub universal_exports::liaison::Addressee::Role::operation: alloc::string::String
+pub universal_exports::liaison::Addressee::Role::role: alloc::string::String
+impl universal_exports::liaison::Addressee
+pub fn universal_exports::liaison::Addressee::operation(&self) -> &str
+impl core::fmt::Display for universal_exports::liaison::Addressee
+pub fn universal_exports::liaison::Addressee::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::str::traits::FromStr for universal_exports::liaison::Addressee
+pub type universal_exports::liaison::Addressee::Err = universal_exports::liaison::LiaisonError
+pub fn universal_exports::liaison::Addressee::from_str(&str) -> core::result::Result<Self, Self::Err>
+pub struct universal_exports::liaison::Liaison
+impl universal_exports::liaison::Liaison
+pub fn universal_exports::liaison::Liaison::new(universal_exports::Gateway, universal_exports::liaison::LiaisonConfig) -> Self
+impl coqui_a2a::agent::Agent for universal_exports::liaison::Liaison
+pub fn universal_exports::liaison::Liaison::agent_card(&self, &coqui_a2a::agent::Caller<'_>) -> coqui_a2a::model::AgentCard
+pub fn universal_exports::liaison::Liaison::cancel_task(&self, &coqui_a2a::agent::Caller<'_>, coqui_a2a::model::CancelTaskRequest) -> core::result::Result<coqui_a2a::model::Task, coqui_a2a::error::A2aError>
+pub fn universal_exports::liaison::Liaison::get_task(&self, &coqui_a2a::agent::Caller<'_>, coqui_a2a::model::GetTaskRequest) -> core::result::Result<coqui_a2a::model::Task, coqui_a2a::error::A2aError>
+pub fn universal_exports::liaison::Liaison::list_tasks(&self, &coqui_a2a::agent::Caller<'_>, coqui_a2a::model::ListTasksRequest) -> core::result::Result<coqui_a2a::model::ListTasksResponse, coqui_a2a::error::A2aError>
+pub fn universal_exports::liaison::Liaison::send_message(&self, &coqui_a2a::agent::Caller<'_>, coqui_a2a::model::SendMessageRequest) -> core::result::Result<coqui_a2a::model::SendMessageResponse, coqui_a2a::error::A2aError>
+pub fn universal_exports::liaison::Liaison::send_streaming_message(&self, &coqui_a2a::agent::Caller<'_>, coqui_a2a::model::SendMessageRequest) -> core::result::Result<coqui_a2a::agent::Events, coqui_a2a::error::A2aError>
+pub fn universal_exports::liaison::Liaison::subscribe_to_task(&self, &coqui_a2a::agent::Caller<'_>, coqui_a2a::model::SubscribeToTaskRequest) -> core::result::Result<coqui_a2a::agent::Events, coqui_a2a::error::A2aError>
+impl core::fmt::Debug for universal_exports::liaison::Liaison
+pub fn universal_exports::liaison::Liaison::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct universal_exports::liaison::LiaisonConfig
+pub universal_exports::liaison::LiaisonConfig::max_links: ai6::bounds::Limit
+pub universal_exports::liaison::LiaisonConfig::peers: alloc::collections::btree::map::BTreeMap<alloc::string::String, universal_exports::liaison::LiaisonPeer>
+pub universal_exports::liaison::LiaisonConfig::plain_beyond_loopback: bool
+pub universal_exports::liaison::LiaisonConfig::poll: core::time::Duration
+pub universal_exports::liaison::LiaisonConfig::recheck: core::time::Duration
+impl universal_exports::liaison::LiaisonConfig
+pub fn universal_exports::liaison::LiaisonConfig::from_settings(&ai6::bootstrap::LiaisonSettings) -> core::result::Result<Self, universal_exports::liaison::LiaisonError>
+pub fn universal_exports::liaison::LiaisonConfig::with_peer(self, universal_exports::liaison::LiaisonPeer) -> Self
+impl core::default::Default for universal_exports::liaison::LiaisonConfig
+pub fn universal_exports::liaison::LiaisonConfig::default() -> Self
+pub struct universal_exports::liaison::LiaisonError(_)
+impl core::error::Error for universal_exports::liaison::LiaisonError
+impl core::fmt::Display for universal_exports::liaison::LiaisonError
+pub fn universal_exports::liaison::LiaisonError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct universal_exports::liaison::LiaisonPeer
+pub universal_exports::liaison::LiaisonPeer::a2a: bool
+pub universal_exports::liaison::LiaisonPeer::addressees: alloc::vec::Vec<universal_exports::liaison::Addressee>
+pub universal_exports::liaison::LiaisonPeer::id: core::option::Option<alloc::string::String>
+pub universal_exports::liaison::LiaisonPeer::name: alloc::string::String
+pub universal_exports::liaison::LiaisonPeer::principal: alloc::string::String
+pub universal_exports::liaison::LiaisonPeer::url: core::option::Option<url::Url>
+impl universal_exports::liaison::LiaisonPeer
+pub fn universal_exports::liaison::LiaisonPeer::sender(&self) -> alloc::string::String
+pub struct universal_exports::liaison::LinkListener
+impl universal_exports::liaison::LinkListener
+pub fn universal_exports::liaison::LinkListener::local_addr(&self) -> core::net::socket_addr::SocketAddr
+pub fn universal_exports::liaison::LinkListener::peer_id(&self) -> &str
+pub fn universal_exports::liaison::LinkListener::start(&universal_exports::liaison::Liaison, core::net::socket_addr::SocketAddr, core::option::Option<alloc::sync::Arc<rustls::server::server_conn::ServerConfig>>, &std::path::Path) -> core::result::Result<Self, universal_exports::liaison::LiaisonError>
+impl core::fmt::Debug for universal_exports::liaison::LinkListener
+pub fn universal_exports::liaison::LinkListener::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::ops::drop::Drop for universal_exports::liaison::LinkListener
+pub fn universal_exports::liaison::LinkListener::drop(&mut self)
+pub const universal_exports::liaison::ADDRESSEE_MEMBER: &str
+#[non_exhaustive] pub enum universal_exports::AttachMode
+pub universal_exports::AttachMode::Read
+pub universal_exports::AttachMode::Write
+#[non_exhaustive] pub enum universal_exports::GatewayError
+pub universal_exports::GatewayError::Backpressure
+pub universal_exports::GatewayError::Conflict
+pub universal_exports::GatewayError::Forbidden
+pub universal_exports::GatewayError::InvalidConfiguration
+pub universal_exports::GatewayError::InvalidCredential
+pub universal_exports::GatewayError::InvalidFrame
+pub universal_exports::GatewayError::NotFound
+pub universal_exports::GatewayError::TooLarge
+pub universal_exports::GatewayError::Unauthorized
+impl core::error::Error for universal_exports::GatewayError
+impl core::fmt::Display for universal_exports::GatewayError
+pub fn universal_exports::GatewayError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct universal_exports::AccessProviders
+impl universal_exports::AccessProviders
+pub fn universal_exports::AccessProviders::from_reverse_proxy(alloc::sync::Arc<dyn coqui_access::kind::Directory>, alloc::sync::Arc<dyn coqui_access::kind::Authorizer>, http::header::name::HeaderName, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn universal_exports::AccessProviders::new(alloc::sync::Arc<dyn coqui_access::kind::Authenticator>, alloc::sync::Arc<dyn coqui_access::kind::Directory>, alloc::sync::Arc<dyn coqui_access::kind::Authorizer>) -> Self
+pub fn universal_exports::AccessProviders::with_page_authenticator(self, alloc::sync::Arc<dyn coqui_access::kind::Authenticator>) -> Self
+pub fn universal_exports::AccessProviders::with_proxy_identity(self, http::header::name::HeaderName, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn universal_exports::AccessProviders::with_proxy_secret(self, impl core::convert::Into<alloc::string::String>, usize) -> core::result::Result<Self, alloc::string::String>
+impl core::fmt::Debug for universal_exports::AccessProviders
+pub fn universal_exports::AccessProviders::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct universal_exports::AgentInput
+pub universal_exports::AgentInput::frame: alloc::vec::Vec<u8>
+pub universal_exports::AgentInput::mission_id: ai6_diptel::MissionId
+pub universal_exports::AgentInput::operation_id: ai6_diptel::OperationId
+pub universal_exports::AgentInput::session_id: ai6_diptel::SessionId
+impl core::fmt::Debug for universal_exports::AgentInput
+pub fn universal_exports::AgentInput::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct universal_exports::AgentRoute
+pub universal_exports::AgentRoute::handler: core::option::Option<alloc::string::String>
+pub universal_exports::AgentRoute::model: core::option::Option<alloc::string::String>
+pub universal_exports::AgentRoute::pool: core::option::Option<alloc::string::String>
+#[non_exhaustive] pub struct universal_exports::AgentView
+pub universal_exports::AgentView::agent: alloc::string::String
+pub universal_exports::AgentView::by_clearance: alloc::collections::btree::map::BTreeMap<alloc::string::String, ai6::directorates::registry::agent_records::AgentTally>
+pub universal_exports::AgentView::clearance: core::option::Option<alloc::string::String>
+pub universal_exports::AgentView::configured_clearance: core::option::Option<alloc::string::String>
+pub universal_exports::AgentView::every_operation: ai6::directorates::registry::agent_records::AgentTally
+pub universal_exports::AgentView::grant: core::option::Option<ai6::directorates::registry::clearance::ClearanceGrant>
+pub universal_exports::AgentView::grant_unreadable: bool
+pub universal_exports::AgentView::holds: alloc::vec::Vec<ai6::directorates::registry::holds::RosterHold>
+pub universal_exports::AgentView::last_mission_at: core::option::Option<f64>
+pub universal_exports::AgentView::model_history: alloc::vec::Vec<ai6::directorates::registry::agent_records::ModelTenure>
+pub universal_exports::AgentView::operation: ai6::directorates::registry::agent_records::AgentTally
+pub universal_exports::AgentView::posted: bool
+pub universal_exports::AgentView::promotion: core::option::Option<ai6::directorates::registry::approvals::ApprovalRequest>
+pub universal_exports::AgentView::retirement: core::option::Option<universal_exports::RetirementNotice>
+pub universal_exports::AgentView::routes: alloc::vec::Vec<universal_exports::AgentRoute>
+pub struct universal_exports::AssistantConfig
+impl universal_exports::AssistantConfig
+pub fn universal_exports::AssistantConfig::agent_id(&self) -> &str
+pub fn universal_exports::AssistantConfig::new(impl core::convert::Into<alloc::string::String>) -> core::result::Result<Self, universal_exports::GatewayError>
+pub fn universal_exports::AssistantConfig::with_cable_limits(self, ai6::bounds::Limit, ai6::bounds::Seconds) -> Self
+pub fn universal_exports::AssistantConfig::with_gateway_limits(self, ai6::directorates::m::assistant::limits::AssistantGatewayLimits) -> core::result::Result<Self, universal_exports::GatewayError>
+pub fn universal_exports::AssistantConfig::with_limits(self, ai6::directorates::m::assistant::limits::AssistantLimits) -> core::result::Result<Self, universal_exports::GatewayError>
+pub fn universal_exports::AssistantConfig::with_route_text_bytes(self, usize) -> Self
+pub fn universal_exports::AssistantConfig::with_view_limits(self, universal_exports::ViewLimits) -> Self
+impl core::default::Default for universal_exports::AssistantConfig
+pub fn universal_exports::AssistantConfig::default() -> Self
+pub struct universal_exports::AttachGrant
+pub universal_exports::AttachGrant::mission_id: ai6_diptel::MissionId
+pub universal_exports::AttachGrant::mode: universal_exports::AttachMode
+pub universal_exports::AttachGrant::operation_id: ai6_diptel::OperationId
+pub universal_exports::AttachGrant::session_id: ai6_diptel::SessionId
+pub struct universal_exports::Attachment
+pub universal_exports::Attachment::events: tokio::sync::broadcast::Receiver<alloc::vec::Vec<u8>>
+pub universal_exports::Attachment::mode: universal_exports::AttachMode
+pub universal_exports::Attachment::replay: alloc::vec::Vec<alloc::vec::Vec<u8>>
+impl core::fmt::Debug for universal_exports::Attachment
+pub fn universal_exports::Attachment::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct universal_exports::BoardAccount
+pub universal_exports::BoardAccount::account: alloc::string::String
+pub universal_exports::BoardAccount::active: alloc::vec::Vec<universal_exports::BoardClaim>
+pub universal_exports::BoardAccount::handler: alloc::string::String
+pub universal_exports::BoardAccount::kind: alloc::string::String
+pub universal_exports::BoardAccount::labels: alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>
+pub universal_exports::BoardAccount::last_used: core::option::Option<f64>
+pub universal_exports::BoardAccount::limited_until: core::option::Option<f64>
+pub universal_exports::BoardAccount::login: core::option::Option<universal_exports::pools::BoardLogin>
+pub universal_exports::BoardAccount::max_concurrent: core::option::Option<usize>
+pub universal_exports::BoardAccount::other_sessions: usize
+pub universal_exports::BoardAccount::pool: alloc::string::String
+pub universal_exports::BoardAccount::priority: i64
+pub universal_exports::BoardAccount::tokens_today: u64
+pub universal_exports::BoardAccount::windows: alloc::vec::Vec<universal_exports::BoardWindow>
+#[non_exhaustive] pub struct universal_exports::BoardClaim
+pub universal_exports::BoardClaim::mission_id: alloc::string::String
+pub universal_exports::BoardClaim::since: f64
+pub universal_exports::BoardClaim::station_id: alloc::string::String
+#[non_exhaustive] pub struct universal_exports::BoardMission
+pub universal_exports::BoardMission::attempts: alloc::vec::Vec<universal_exports::MissionAttempt>
+pub universal_exports::BoardMission::brief: core::option::Option<universal_exports::LaunchManifest>
+pub universal_exports::BoardMission::handle: alloc::string::String
+pub universal_exports::BoardMission::mission_id: alloc::string::String
+pub universal_exports::BoardMission::operation_id: alloc::string::String
+pub universal_exports::BoardMission::sessions: alloc::vec::Vec<universal_exports::BoardSession>
+pub universal_exports::BoardMission::usage: core::option::Option<ai6::directorates::medical::usage::MissionUsage>
+#[non_exhaustive] pub struct universal_exports::BoardOperation
+pub universal_exports::BoardOperation::operation_id: alloc::string::String
+pub universal_exports::BoardOperation::parent: core::option::Option<alloc::string::String>
+#[non_exhaustive] pub struct universal_exports::BoardSession
+pub universal_exports::BoardSession::agent: core::option::Option<alloc::string::String>
+pub universal_exports::BoardSession::exposure: alloc::vec::Vec<alloc::string::String>
+pub universal_exports::BoardSession::mission_id: alloc::string::String
+pub universal_exports::BoardSession::operation_id: alloc::string::String
+pub universal_exports::BoardSession::reason: core::option::Option<alloc::string::String>
+pub universal_exports::BoardSession::sequence: u64
+pub universal_exports::BoardSession::session_id: alloc::string::String
+pub universal_exports::BoardSession::state: core::option::Option<alloc::string::String>
+pub universal_exports::BoardSession::station_id: core::option::Option<alloc::string::String>
+pub universal_exports::BoardSession::updated_at: core::option::Option<f64>
+#[non_exhaustive] pub struct universal_exports::BoardStation
+pub universal_exports::BoardStation::capacity: usize
+pub universal_exports::BoardStation::config: core::option::Option<ai6::directorates::m::config::ConfigStatus>
+pub universal_exports::BoardStation::handlers: alloc::vec::Vec<alloc::string::String>
+pub universal_exports::BoardStation::head_of_station: core::option::Option<ai6::directorates::registry::logbook::StationReport>
+pub universal_exports::BoardStation::headquarters: bool
+pub universal_exports::BoardStation::healthy: bool
+pub universal_exports::BoardStation::issues_weakened: alloc::vec::Vec<alloc::string::String>
+pub universal_exports::BoardStation::operations: alloc::vec::Vec<alloc::string::String>
+pub universal_exports::BoardStation::resources: core::option::Option<ai6::directorates::m::placement::Resources>
+pub universal_exports::BoardStation::roles: alloc::vec::Vec<alloc::string::String>
+pub universal_exports::BoardStation::running: usize
+pub universal_exports::BoardStation::seen: f64
+pub universal_exports::BoardStation::station_id: alloc::string::String
+pub universal_exports::BoardStation::theaters: alloc::vec::Vec<universal_exports::BoardTheater>
+#[non_exhaustive] pub struct universal_exports::BoardTheater
+pub universal_exports::BoardTheater::access: alloc::string::String
+pub universal_exports::BoardTheater::agents: alloc::string::String
+pub universal_exports::BoardTheater::capabilities: core::option::Option<ai6::directorates::q::transport::Capabilities>
+pub universal_exports::BoardTheater::egress: alloc::string::String
+pub universal_exports::BoardTheater::harnesses: alloc::vec::Vec<alloc::string::String>
+pub universal_exports::BoardTheater::host: core::option::Option<alloc::string::String>
+pub universal_exports::BoardTheater::id: alloc::string::String
+pub universal_exports::BoardTheater::labels: alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>
+pub universal_exports::BoardTheater::made_for: core::option::Option<alloc::string::String>
+pub universal_exports::BoardTheater::provider: core::option::Option<alloc::string::String>
+pub universal_exports::BoardTheater::report: core::option::Option<ai6::directorates::q::provision::ProbeReport>
+pub universal_exports::BoardTheater::requires: core::option::Option<ai6::directorates::q::provision::Requirements>
+pub universal_exports::BoardTheater::resources: core::option::Option<ai6::directorates::m::placement::Resources>
+pub universal_exports::BoardTheater::sessions: usize
+pub universal_exports::BoardTheater::unavailable: core::option::Option<alloc::string::String>
+pub universal_exports::BoardTheater::weakened: alloc::vec::Vec<alloc::string::String>
+pub universal_exports::BoardTheater::workdir: core::option::Option<alloc::string::String>
+#[non_exhaustive] pub struct universal_exports::BoardWindow
+pub universal_exports::BoardWindow::name: alloc::string::String
+pub universal_exports::BoardWindow::resets_at: core::option::Option<f64>
+pub universal_exports::BoardWindow::status: core::option::Option<alloc::string::String>
+pub universal_exports::BoardWindow::used_permille: core::option::Option<u16>
+#[non_exhaustive] pub struct universal_exports::ControlStatus
+pub universal_exports::ControlStatus::action: alloc::string::String
+pub universal_exports::ControlStatus::agent: core::option::Option<alloc::string::String>
+pub universal_exports::ControlStatus::control_id: alloc::string::String
+pub universal_exports::ControlStatus::finished_at: core::option::Option<f64>
+pub universal_exports::ControlStatus::mission_id: alloc::string::String
+pub universal_exports::ControlStatus::operation_id: alloc::string::String
+pub universal_exports::ControlStatus::reason: core::option::Option<alloc::string::String>
+pub universal_exports::ControlStatus::requested_at: f64
+pub universal_exports::ControlStatus::requested_by: alloc::string::String
+pub universal_exports::ControlStatus::session_id: core::option::Option<alloc::string::String>
+pub universal_exports::ControlStatus::state: core::option::Option<alloc::string::String>
+pub universal_exports::ControlStatus::station_id: alloc::string::String
+pub universal_exports::ControlStatus::status: alloc::string::String
+#[non_exhaustive] pub struct universal_exports::EffectiveOperation
+pub universal_exports::EffectiveOperation::definition: serde_json::map::Map<alloc::string::String, serde_json::value::Value>
+pub universal_exports::EffectiveOperation::inherit: bool
+pub universal_exports::EffectiveOperation::lineage: alloc::vec::Vec<alloc::string::String>
+pub universal_exports::EffectiveOperation::operation_id: alloc::string::String
+pub universal_exports::EffectiveOperation::origins: alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>
+pub universal_exports::EffectiveOperation::revision: alloc::string::String
+pub struct universal_exports::EitherAuthorizer
+pub universal_exports::EitherAuthorizer::live: alloc::sync::Arc<universal_exports::LiveAccess>
+pub universal_exports::EitherAuthorizer::plugin: alloc::sync::Arc<dyn coqui_access::kind::Authorizer>
+impl coqui_access::kind::Authorizer for universal_exports::EitherAuthorizer
+pub fn universal_exports::EitherAuthorizer::authorize(&self, coqui_access::model::AuthorizationRequest) -> core::result::Result<coqui_access::model::AuthorizationDecision, guatiao::library::kind::ProviderError>
+impl core::fmt::Debug for universal_exports::EitherAuthorizer
+pub fn universal_exports::EitherAuthorizer::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct universal_exports::EntryView
+pub universal_exports::EntryView::actor: alloc::string::String
+pub universal_exports::EntryView::at: f64
+pub universal_exports::EntryView::dropped: alloc::vec::Vec<alloc::string::String>
+pub universal_exports::EntryView::id: alloc::string::String
+pub universal_exports::EntryView::issue: alloc::string::String
+pub universal_exports::EntryView::kind: ai6::directorates::registry::mission_issues::OutboxKind
+pub universal_exports::EntryView::reason: core::option::Option<alloc::string::String>
+pub universal_exports::EntryView::state: ai6::directorates::registry::mission_issues::OutboxState
+pub universal_exports::EntryView::url: core::option::Option<alloc::string::String>
+pub struct universal_exports::Gateway
+impl universal_exports::Gateway
+pub async fn universal_exports::Gateway::attach(&self, &ai6_diptel::SessionId, &str, u64) -> core::result::Result<universal_exports::Attachment, universal_exports::GatewayError>
+pub fn universal_exports::Gateway::authenticate_station(&self, &str) -> core::result::Result<(), universal_exports::GatewayError>
+pub async fn universal_exports::Gateway::board_missions(&self) -> alloc::vec::Vec<universal_exports::BoardMission>
+pub async fn universal_exports::Gateway::board_sessions(&self) -> alloc::vec::Vec<universal_exports::BoardSession>
+pub async fn universal_exports::Gateway::disconnect(&self, universal_exports::Attachment)
+pub async fn universal_exports::Gateway::disconnect_connection(&self, &ai6_diptel::SessionId, &str)
+pub async fn universal_exports::Gateway::exchange_attach_token(&self, &str) -> core::result::Result<alloc::string::String, universal_exports::GatewayError>
+pub async fn universal_exports::Gateway::ingest(&self, &str, &ai6_diptel::SessionId, u64, alloc::vec::Vec<u8>) -> core::result::Result<(), universal_exports::GatewayError>
+pub async fn universal_exports::Gateway::issue_attach_token(&self, &str, universal_exports::AttachGrant) -> core::result::Result<alloc::string::String, universal_exports::GatewayError>
+pub fn universal_exports::Gateway::liaison(&self) -> core::option::Option<universal_exports::liaison::Liaison>
+pub fn universal_exports::Gateway::new(universal_exports::GatewayConfig) -> Self
+pub async fn universal_exports::Gateway::next_sequence(&self, &str, &ai6_diptel::SessionId) -> core::result::Result<u64, universal_exports::GatewayError>
+pub fn universal_exports::Gateway::pages_router(&self) -> core::option::Option<axum::routing::Router>
+pub fn universal_exports::Gateway::public_origin(&self) -> &str
+pub async fn universal_exports::Gateway::publish_lifecycle(&self, &str, ai6_diptel::LifecycleEvent) -> core::result::Result<(), universal_exports::GatewayError>
+pub async fn universal_exports::Gateway::publish_terminal_output(&self, &str, ai6_diptel::SessionId, u64, alloc::vec::Vec<u8>) -> core::result::Result<(), universal_exports::GatewayError>
+pub async fn universal_exports::Gateway::receive_agent_input(&self) -> core::option::Option<universal_exports::AgentInput>
+pub async fn universal_exports::Gateway::receive_agent_input_within(&self, core::time::Duration) -> core::option::Option<universal_exports::AgentInput>
+pub async fn universal_exports::Gateway::register_session(&self, &str, ai6_diptel::OperationId, ai6_diptel::MissionId, ai6_diptel::SessionId) -> core::result::Result<(), universal_exports::GatewayError>
+pub fn universal_exports::Gateway::router(self) -> axum::routing::Router
+pub async fn universal_exports::Gateway::serve_loopback<F>(self, u16, F) -> core::result::Result<(), core::io::error::Error> where F: core::future::future::Future<Output = ()> + core::marker::Send + 'static
+pub async fn universal_exports::Gateway::serve_pages<F>(self, core::net::socket_addr::SocketAddr, F) -> core::result::Result<(), core::io::error::Error> where F: core::future::future::Future<Output = ()> + core::marker::Send + 'static
+pub async fn universal_exports::Gateway::submit_input(&self, &ai6_diptel::SessionId, &str, alloc::vec::Vec<u8>) -> core::result::Result<(), universal_exports::GatewayError>
+pub fn universal_exports::Gateway::terminal_bytes(&self, &ai6_diptel::SessionId) -> usize
+pub fn universal_exports::Gateway::with_access(universal_exports::GatewayConfig, alloc::sync::Arc<dyn ai6::directorates::registry::backend::RegistryBackend>, universal_exports::AccessProviders) -> Self
+pub fn universal_exports::Gateway::with_access_admin(self, alloc::sync::Arc<universal_exports::LiveAccess>) -> Self
+pub fn universal_exports::Gateway::with_accounts(self, alloc::sync::Arc<dyn coqui_access::kind::Accounts>) -> Self
+pub fn universal_exports::Gateway::with_assistant(self, universal_exports::AssistantConfig) -> Self
+pub fn universal_exports::Gateway::with_job_poll_max_wait(self, core::time::Duration) -> Self
+pub fn universal_exports::Gateway::with_liaison(self, universal_exports::liaison::LiaisonConfig) -> Self
+pub fn universal_exports::Gateway::with_pages(self, universal_exports::PagesConfig) -> core::result::Result<Self, universal_exports::GatewayError>
+pub fn universal_exports::Gateway::with_registry(universal_exports::GatewayConfig, alloc::sync::Arc<dyn ai6::directorates::registry::backend::RegistryBackend>) -> Self
+pub fn universal_exports::Gateway::with_roster(self, alloc::sync::Arc<dyn ai6::directorates::m::config::ConfigProvider>) -> Self
+impl universal_exports::Gateway
+pub async fn universal_exports::Gateway::serve_tls<F>(self, tokio::net::tcp::listener::TcpListener, alloc::sync::Arc<rustls::server::server_conn::ServerConfig>, F) -> core::io::error::Result<()> where F: core::future::future::Future<Output = ()> + core::marker::Send + 'static
+impl core::fmt::Debug for universal_exports::Gateway
+pub fn universal_exports::Gateway::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct universal_exports::GatewayConfig
+impl universal_exports::GatewayConfig
+pub fn universal_exports::GatewayConfig::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>, universal_exports::GatewayLimits, core::time::Duration, core::time::Duration) -> core::result::Result<Self, universal_exports::GatewayError>
+pub fn universal_exports::GatewayConfig::public_origin(&self) -> &str
+pub fn universal_exports::GatewayConfig::with_login_limits(self, universal_exports::LoginLimits) -> Self
+pub fn universal_exports::GatewayConfig::with_unex_limits(self, ai6::directorates::m::unex_limits::UnexLimits) -> Self
+impl core::fmt::Debug for universal_exports::GatewayConfig
+pub fn universal_exports::GatewayConfig::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct universal_exports::GatewayLimits
+pub universal_exports::GatewayLimits::buffer_budget_bytes: ai6::bounds::Limit
+pub universal_exports::GatewayLimits::client_slots: ai6::bounds::Limit
+pub universal_exports::GatewayLimits::fanout_capacity: usize
+pub universal_exports::GatewayLimits::input_queue_capacity: usize
+pub universal_exports::GatewayLimits::max_clients_per_session: usize
+pub universal_exports::GatewayLimits::max_frame_bytes: usize
+pub universal_exports::GatewayLimits::max_input_frames_per_second: u32
+pub universal_exports::GatewayLimits::max_sessions: usize
+pub universal_exports::GatewayLimits::origin_bytes: ai6::bounds::Limit
+pub universal_exports::GatewayLimits::scrollback_events: usize
+pub universal_exports::GatewayLimits::socket_buffer_bytes: usize
+pub universal_exports::GatewayLimits::station_token_min_bytes: usize
+impl core::convert::From<&ai6::directorates::m::unex_limits::UnexGatewayLimits> for universal_exports::GatewayLimits
+pub fn universal_exports::GatewayLimits::from(&ai6::directorates::m::unex_limits::UnexGatewayLimits) -> Self
+impl core::default::Default for universal_exports::GatewayLimits
+pub fn universal_exports::GatewayLimits::default() -> Self
+#[non_exhaustive] pub struct universal_exports::HeldBriefDecision
+pub universal_exports::HeldBriefDecision::key: alloc::string::String
+pub universal_exports::HeldBriefDecision::operation_id: alloc::string::String
+pub universal_exports::HeldBriefDecision::state: &'static str
+#[non_exhaustive] pub struct universal_exports::HeldBriefEntry
+pub universal_exports::HeldBriefEntry::held: ai6::directorates::registry::vetting::HeldBrief
+pub universal_exports::HeldBriefEntry::key: alloc::string::String
+#[non_exhaustive] pub struct universal_exports::IssueView
+pub universal_exports::IssueView::issue: alloc::string::String
+pub universal_exports::IssueView::issue_state: core::option::Option<alloc::string::String>
+pub universal_exports::IssueView::item: alloc::string::String
+pub universal_exports::IssueView::labels: alloc::vec::Vec<alloc::string::String>
+pub universal_exports::IssueView::linked_by: alloc::string::String
+pub universal_exports::IssueView::open_question: core::option::Option<universal_exports::QuestionView>
+pub universal_exports::IssueView::phase: core::option::Option<alloc::string::String>
+pub universal_exports::IssueView::relation: ai6::directorates::registry::mission_issues::LinkRelation
+pub universal_exports::IssueView::state: ai6::directorates::registry::mission_issues::LinkState
+pub universal_exports::IssueView::title: core::option::Option<alloc::string::String>
+pub universal_exports::IssueView::tracker: alloc::string::String
+pub universal_exports::IssueView::url: core::option::Option<alloc::string::String>
+#[non_exhaustive] pub struct universal_exports::IssueWrite
+pub universal_exports::IssueWrite::answered: bool
+pub universal_exports::IssueWrite::entry: core::option::Option<alloc::string::String>
+pub universal_exports::IssueWrite::issue: core::option::Option<alloc::string::String>
+pub universal_exports::IssueWrite::proposal: core::option::Option<alloc::string::String>
+pub universal_exports::IssueWrite::state: alloc::string::String
+#[non_exhaustive] pub struct universal_exports::LaunchManifest
+pub universal_exports::LaunchManifest::agent_id: core::option::Option<alloc::string::String>
+pub universal_exports::LaunchManifest::effort: core::option::Option<alloc::string::String>
+pub universal_exports::LaunchManifest::environment_keys: alloc::vec::Vec<alloc::string::String>
+pub universal_exports::LaunchManifest::handler_provider: alloc::string::String
+pub universal_exports::LaunchManifest::mode: alloc::string::String
+pub universal_exports::LaunchManifest::model: core::option::Option<alloc::string::String>
+pub universal_exports::LaunchManifest::name: core::option::Option<alloc::string::String>
+pub universal_exports::LaunchManifest::prompt: alloc::string::String
+pub universal_exports::LaunchManifest::provenance: core::option::Option<ai6::directorates::registry::bona_fides::Provenance>
+pub universal_exports::LaunchManifest::role_id: core::option::Option<alloc::string::String>
+pub universal_exports::LaunchManifest::station_id: alloc::string::String
+pub universal_exports::LaunchManifest::terminal_provider: alloc::string::String
+pub universal_exports::LaunchManifest::theater_id: core::option::Option<alloc::string::String>
+pub universal_exports::LaunchManifest::working_directory: alloc::string::String
+pub struct universal_exports::LiveAccess
+impl universal_exports::LiveAccess
+pub fn universal_exports::LiveAccess::apply(&self, &ai6::directorates::m::config::ConfigSnapshot)
+pub fn universal_exports::LiveAccess::effective(&self) -> alloc::sync::Arc<ai6::directorates::m::access::effective::EffectiveAccess>
+pub fn universal_exports::LiveAccess::has_no_chief(&self) -> bool
+pub fn universal_exports::LiveAccess::invalid(&self) -> core::option::Option<alloc::string::String>
+pub fn universal_exports::LiveAccess::mark_invalid(&self, &str)
+pub fn universal_exports::LiveAccess::new(alloc::sync::Arc<dyn ai6::directorates::m::config::ConfigProvider>, alloc::vec::Vec<alloc::string::String>, core::option::Option<alloc::string::String>) -> core::result::Result<Self, alloc::string::String>
+pub fn universal_exports::LiveAccess::observe_lineage(&self, ai6::directorates::m::access::lineage::Lineage)
+pub fn universal_exports::LiveAccess::reload(&self) -> core::result::Result<(), alloc::string::String>
+pub fn universal_exports::LiveAccess::seed(&self, &ai6::directorates::m::config::ConfigSnapshot, &alloc::sync::Arc<dyn ai6::directorates::registry::backend::RegistryBackend>) -> core::result::Result<bool, alloc::string::String>
+impl coqui_access::kind::Authorizer for universal_exports::LiveAccess
+pub fn universal_exports::LiveAccess::authorize(&self, coqui_access::model::AuthorizationRequest) -> core::result::Result<coqui_access::model::AuthorizationDecision, guatiao::library::kind::ProviderError>
+impl core::fmt::Debug for universal_exports::LiveAccess
+pub fn universal_exports::LiveAccess::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct universal_exports::LoginLimits
+pub universal_exports::LoginLimits::address_header: core::option::Option<http::header::name::HeaderName>
+pub universal_exports::LoginLimits::address_window: core::time::Duration
+pub universal_exports::LoginLimits::forget_every: u32
+pub universal_exports::LoginLimits::name_bytes: usize
+pub universal_exports::LoginLimits::name_window: core::time::Duration
+pub universal_exports::LoginLimits::per_address: core::num::nonzero::NonZeroU32
+pub universal_exports::LoginLimits::per_name: core::num::nonzero::NonZeroU32
+impl core::default::Default for universal_exports::LoginLimits
+pub fn universal_exports::LoginLimits::default() -> Self
+#[non_exhaustive] pub struct universal_exports::MissionAttempt
+pub universal_exports::MissionAttempt::account: core::option::Option<ai6::directorates::registry::accounts::AccountRef>
+pub universal_exports::MissionAttempt::attempt: u32
+pub universal_exports::MissionAttempt::checkpoint_branch: core::option::Option<alloc::string::String>
+pub universal_exports::MissionAttempt::deliverables: alloc::vec::Vec<alloc::string::String>
+pub universal_exports::MissionAttempt::evidence: alloc::vec::Vec<ai6::directorates::registry::sessions::Evidence>
+pub universal_exports::MissionAttempt::final_report: core::option::Option<alloc::string::String>
+pub universal_exports::MissionAttempt::handle: core::option::Option<alloc::string::String>
+pub universal_exports::MissionAttempt::lost: core::option::Option<alloc::string::String>
+pub universal_exports::MissionAttempt::predecessor: core::option::Option<alloc::string::String>
+pub universal_exports::MissionAttempt::probe_requested: core::option::Option<f64>
+pub universal_exports::MissionAttempt::provider_session_id: core::option::Option<alloc::string::String>
+pub universal_exports::MissionAttempt::route: core::option::Option<ai6::directorates::m::roster::RouteRef>
+pub universal_exports::MissionAttempt::session_id: alloc::string::String
+pub universal_exports::MissionAttempt::station: alloc::string::String
+pub universal_exports::MissionAttempt::status: alloc::string::String
+pub universal_exports::MissionAttempt::theater: core::option::Option<alloc::string::String>
+pub universal_exports::MissionAttempt::verdict: core::option::Option<ai6::directorates::registry::sessions::MissionVerdict>
+#[non_exhaustive] pub struct universal_exports::MissionIssues
+pub universal_exports::MissionIssues::entries: alloc::vec::Vec<universal_exports::EntryView>
+pub universal_exports::MissionIssues::issues: alloc::vec::Vec<universal_exports::IssueView>
+pub universal_exports::MissionIssues::replies: universal_exports::ReplyCounts
+pub struct universal_exports::PagesConfig
+pub universal_exports::PagesConfig::dir: std::path::PathBuf
+pub universal_exports::PagesConfig::listen: core::option::Option<core::net::socket_addr::SocketAddr>
+pub universal_exports::PagesConfig::origin: core::option::Option<alloc::string::String>
+impl universal_exports::PagesConfig
+pub fn universal_exports::PagesConfig::new(impl core::convert::Into<std::path::PathBuf>) -> Self
+pub fn universal_exports::PagesConfig::with_origin(self, impl core::convert::Into<alloc::string::String>, core::net::socket_addr::SocketAddr) -> Self
+#[non_exhaustive] pub struct universal_exports::PlacementPreview
+pub universal_exports::PlacementPreview::choices: alloc::vec::Vec<ai6::directorates::m::placement::PlacementChoice>
+pub universal_exports::PlacementPreview::operation_id: alloc::string::String
+pub universal_exports::PlacementPreview::policy_station: alloc::string::String
+pub universal_exports::PlacementPreview::rejections: alloc::vec::Vec<ai6::directorates::m::placement::PlacementRejection>
+#[non_exhaustive] pub struct universal_exports::PoolBoard
+pub universal_exports::PoolBoard::accounts: alloc::vec::Vec<universal_exports::BoardAccount>
+pub universal_exports::PoolBoard::operation_id: alloc::string::String
+#[non_exhaustive] pub struct universal_exports::QuestionView
+pub universal_exports::QuestionView::asked_at: f64
+pub universal_exports::QuestionView::expires_at: f64
+#[non_exhaustive] pub struct universal_exports::ReplyCounts
+pub universal_exports::ReplyCounts::delivered: usize
+pub universal_exports::ReplyCounts::ignored: usize
+pub universal_exports::ReplyCounts::pending: usize
+#[non_exhaustive] pub struct universal_exports::RetirementNotice
+pub universal_exports::RetirementNotice::on_retire: alloc::string::String
+pub universal_exports::RetirementNotice::retire_on: alloc::string::String
+pub universal_exports::RetirementNotice::status: alloc::string::String
+#[non_exhaustive] pub struct universal_exports::RosterChange
+pub universal_exports::RosterChange::revision: alloc::string::String
+pub universal_exports::RosterChange::weakened: alloc::vec::Vec<alloc::string::String>
+#[non_exhaustive] pub struct universal_exports::RosterRecord
+pub universal_exports::RosterRecord::definition: serde_json::value::Value
+pub universal_exports::RosterRecord::key: alloc::string::String
+pub universal_exports::RosterRecord::revision: alloc::string::String
+#[non_exhaustive] pub struct universal_exports::RosterRecords
+pub universal_exports::RosterRecords::kind: alloc::string::String
+pub universal_exports::RosterRecords::records: alloc::vec::Vec<universal_exports::RosterRecord>
+pub universal_exports::RosterRecords::revision: alloc::string::String
+pub universal_exports::RosterRecords::writable: bool
+#[non_exhaustive] pub struct universal_exports::StationBoard
+pub universal_exports::StationBoard::headquarters_station: core::option::Option<alloc::string::String>
+pub universal_exports::StationBoard::operations: alloc::vec::Vec<universal_exports::BoardOperation>
+pub universal_exports::StationBoard::stations: alloc::vec::Vec<universal_exports::BoardStation>
+#[non_exhaustive] pub struct universal_exports::TimelineItem
+pub universal_exports::TimelineItem::action: alloc::string::String
+pub universal_exports::TimelineItem::actor: core::option::Option<alloc::string::String>
+pub universal_exports::TimelineItem::at: f64
+pub universal_exports::TimelineItem::detail: alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>
+pub universal_exports::TimelineItem::handle: core::option::Option<alloc::string::String>
+pub universal_exports::TimelineItem::id: alloc::string::String
+pub universal_exports::TimelineItem::kind: alloc::string::String
+pub universal_exports::TimelineItem::mission_id: core::option::Option<alloc::string::String>
+pub universal_exports::TimelineItem::operation_id: alloc::string::String
+pub universal_exports::TimelineItem::session_id: core::option::Option<alloc::string::String>
+pub universal_exports::TimelineItem::station_id: core::option::Option<alloc::string::String>
+pub universal_exports::TimelineItem::target: core::option::Option<alloc::string::String>
+#[non_exhaustive] pub struct universal_exports::TimelinePage
+pub universal_exports::TimelinePage::items: alloc::vec::Vec<universal_exports::TimelineItem>
+pub universal_exports::TimelinePage::next_cursor: core::option::Option<alloc::string::String>
+pub universal_exports::TimelinePage::operation_id: alloc::string::String
+pub struct universal_exports::ViewLimits
+pub universal_exports::ViewLimits::blocks: usize
+pub universal_exports::ViewLimits::columns: usize
+pub universal_exports::ViewLimits::diff_bytes: usize
+pub universal_exports::ViewLimits::fields: usize
+pub universal_exports::ViewLimits::graph_edges: usize
+pub universal_exports::ViewLimits::graph_nodes: usize
+pub universal_exports::ViewLimits::items: usize
+pub universal_exports::ViewLimits::navigate_label_bytes: usize
+pub universal_exports::ViewLimits::pie_slices: usize
+pub universal_exports::ViewLimits::points: usize
+pub universal_exports::ViewLimits::rows: usize
+pub universal_exports::ViewLimits::schedule_rows: usize
+pub universal_exports::ViewLimits::series: usize
+pub universal_exports::ViewLimits::short_bytes: usize
+pub universal_exports::ViewLimits::svg_bytes: usize
+pub universal_exports::ViewLimits::svg_depth: usize
+pub universal_exports::ViewLimits::svg_elements: usize
+pub universal_exports::ViewLimits::svg_id_bytes: usize
+pub universal_exports::ViewLimits::text_bytes: usize
+pub universal_exports::ViewLimits::view_bytes: usize
+impl core::default::Default for universal_exports::ViewLimits
+pub fn universal_exports::ViewLimits::default() -> Self
+pub const universal_exports::PROXY_SECRET_HEADER: &str
+pub fn universal_exports::tls_server_config(&[u8], &[u8]) -> core::result::Result<rustls::server::server_conn::ServerConfig, alloc::string::String>

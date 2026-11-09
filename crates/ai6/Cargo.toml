@@ -1,0 +1,152 @@
+[package]
+name = "ai6"
+description = "The AI6 Mission daemon and command"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+readme = "README.md"
+exclude = [".*", "*.local.*"]
+
+[features]
+default = []
+# The Station and the field runner (`ai6::station::runner`), which a Station reaches over HTTP.
+daemon = ["gate", "acp","dep:coqui-access-kit", "dep:axum", "dep:tokio", "dep:subtle", "dep:futures-util", "dep:sysinfo", "dep:ring", "dep:rustix", "dep:base64", "dep:crypto_box", "guatiao/load"]
+# The Agent Client Protocol wire (`ai6::directorates::section_00::acp`): the client a Station
+# and the `acp` handler drive agents with, and the agent side serving any AgentHandler.
+acp = ["dep:agent-client-protocol", "dep:coqui-acp", "dep:futures"]
+# The harness gate's client of a Station's Cable endpoint (`ai6::directorates::section_00::gate`).
+gate = ["dep:ureq", "dep:url"]
+# Adds bounded background event publication to the Universal Exports gateway.
+publisher = ["daemon", "tls-roots", "dep:ai6-diptel", "dep:base64", "dep:url"]
+# `ai6::tls`: HTTPS trust for a ureq client, the public roots and a deployment's own authorities.
+tls-roots = ["dep:ureq", "dep:webpki-root-certs"]
+cables-mcp = ["daemon", "dep:rmcp", "dep:schemars"]
+station-tls = ["dep:coqui-peer-tls", "dep:rustls", "dep:base64"]
+# A Registry and roster kept in a SQLite database file.
+sqlite = ["dep:rusqlite"]
+# A Registry and roster kept in PostgreSQL, shared by every Station of an HA deployment.
+postgres = ["dep:tokio-postgres", "dep:tokio", "tokio/sync", "tokio/time", "dep:tokio-rustls", "dep:rustls", "dep:rustls-native-certs"]
+cli = ["daemon", "publisher", "cables-mcp", "station-tls", "sqlite", "postgres", "dep:clap", "tokio/signal"]
+
+[[bin]]
+name = "ai6"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[[example]]
+name = "settings_reference"
+required-features = ["cli"]
+
+[[test]]
+name = "acp_wire"
+path = "tests/acp_wire.rs"
+required-features = ["acp"]
+
+[[test]]
+name = "cli"
+path = "tests/cli.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "bootstrap"
+path = "tests/bootstrap.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "config_rm"
+path = "tests/config_rm.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "ha"
+path = "tests/ha.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "shared_logins"
+path = "tests/shared_logins.rs"
+required-features = ["cli"]
+
+[dependencies]
+agent-client-protocol = { workspace = true, optional = true }
+coqui-acp = { workspace = true, optional = true }
+coqui-acp-provider.workspace = true
+futures = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+coqui-access.workspace = true
+coqui-roles.workspace = true
+coqui-access-kit = { workspace = true, optional = true }
+guatiao = { workspace = true, features = ["provider"] }
+guatiao-intake.workspace = true
+guatiao-serde = { workspace = true, features = ["json", "toml", "yaml"] }
+anycfg.workspace = true
+fs2 = "0.4"
+futures-util = { workspace = true, optional = true }
+serde = { workspace = true, features = ["alloc"] }
+serde_json.workspace = true
+rmcp = { workspace = true, optional = true }
+schemars = { workspace = true, optional = true }
+sha2.workspace = true
+coqui-net-acl = { workspace = true }
+coqui-peer = { workspace = true, features = ["serde"] }
+# Ed25519 for publisher signatures on provider libraries; already built for rustls.
+ring = { version = "0.17.14", optional = true }
+base64 = { workspace = true, optional = true }
+coqui-peer-tls = { workspace = true, optional = true }
+crypto_box = { workspace = true, optional = true }
+time = { workspace = true }
+rustls = { workspace = true, optional = true }
+globset.workspace = true
+lru.workspace = true
+rusqlite = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
+rustls-pki-types.workspace = true
+rustls-webpki.workspace = true
+webpki-root-certs = { workspace = true, optional = true }
+tokio-postgres = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+regex.workspace = true
+subtle = { workspace = true, optional = true }
+sysinfo = { workspace = true, optional = true }
+tempfile.workspace = true
+toml.workspace = true
+serde-saphyr.workspace = true
+granit-parser.workspace = true
+tokio = { workspace = true, optional = true }
+ureq = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+ai6-diptel = { path = "../ai6-diptel", optional = true }
+uuid.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# O_NOFOLLOW and O_NONBLOCK, to read a checkout's harness configuration without following
+# a link or waiting on a pipe.
+libc = "0.2.170"
+# The effective user, to tell a Station running as root; already built for tempfile.
+rustix = { version = "1.1.5", features = ["process", "termios"], optional = true }
+
+[dev-dependencies]
+rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest"] }
+tokio.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+# The access plugins are libraries to load, never to link: depending on them has Cargo build
+# each one beside the test binaries, where the plugin tests scan for them.
+coqui-access-key-plugin = { git = "https://github.com/Boriken-Dev/coqui-access", rev = "af03569c43e1abc6599b95366e6df99bc88234b9" }
+coqui-access-ldap-plugin = { git = "https://github.com/Boriken-Dev/coqui-access", rev = "af03569c43e1abc6599b95366e6df99bc88234b9" }
+coqui-access-password-plugin = { git = "https://github.com/Boriken-Dev/coqui-access", rev = "af03569c43e1abc6599b95366e6df99bc88234b9" }
+coqui-access-mtls-plugin = { git = "https://github.com/Boriken-Dev/coqui-access", rev = "af03569c43e1abc6599b95366e6df99bc88234b9" }
+coqui-access-proxy-plugin = { git = "https://github.com/Boriken-Dev/coqui-access", rev = "af03569c43e1abc6599b95366e6df99bc88234b9" }
+coqui-roles-plugin = { git = "https://github.com/Boriken-Dev/coqui-access", rev = "af03569c43e1abc6599b95366e6df99bc88234b9" }
+# Built beside the test binaries for the same reason: the assistant desk's tests load it to
+# clone and commit real repositories.
+ai6-safehouse-git = { path = "../providers/safehouses/git" }
+
+# Windows only: on Unix it links the system's libpam, which a test machine need not have.
+[target.'cfg(windows)'.dev-dependencies]
+coqui-access-system-plugin = { git = "https://github.com/Boriken-Dev/coqui-access", rev = "af03569c43e1abc6599b95366e6df99bc88234b9" }

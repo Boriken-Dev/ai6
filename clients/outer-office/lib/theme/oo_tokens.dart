@@ -1,0 +1,589 @@
+import 'package:material_ui/material_ui.dart';
+
+import 'oo_art.dart';
+
+/// The preference value that follows the operating system: Light when it is light, Night
+/// Ops when it is dark.
+const ooSystemTheme = 'system';
+
+/// The Outer Office themes, by the id `oo.theme` stores.
+enum OoThemeId {
+  nightOps('night-ops', 'Night Ops', Brightness.dark, 'Navy and warm gold'),
+  blackOps('black-ops', 'Black Ops', Brightness.dark, 'Quiet charcoal'),
+  dusk('dusk', 'Dusk', Brightness.dark, 'Warm evening plum and copper'),
+  classic('classic', 'Classic', Brightness.light, 'Paper dossier in brown ink'),
+  light('light', 'Light', Brightness.light, 'Clear daylight'),
+  redFile('red-file', 'Red File', Brightness.dark, 'Restrained crimson');
+
+  const OoThemeId(this.id, this.label, this.brightness, this.character);
+
+  /// The stored id, such as `night-ops`.
+  final String id;
+  final String label;
+  final Brightness brightness;
+
+  /// One line on the theme's look, shown beside its name in the chooser.
+  final String character;
+
+  /// The theme with this id, or null for `system`, an unknown id or none.
+  static OoThemeId? byId(String? id) =>
+      values.where((theme) => theme.id == id).firstOrNull;
+
+  /// This theme's colours.
+  OoTokens get tokens => switch (this) {
+    nightOps => _nightOps,
+    blackOps => _blackOps,
+    dusk => _dusk,
+    classic => _classic,
+    light => _light,
+    redFile => _redFile,
+  };
+}
+
+/// A stored theme preference made valid: a theme id or [ooSystemTheme]; absent or unknown
+/// is Night Ops.
+String ooThemePreference(String? stored) =>
+    stored == ooSystemTheme || OoThemeId.byId(stored) != null
+    ? stored!
+    : OoThemeId.nightOps.id;
+
+/// How a theme redraws its hero art in its own colours.
+enum OoArtTint {
+  /// As drawn.
+  none,
+
+  /// A dark, mostly blue-grey picture: its darkest parts become `surface`, its brightest
+  /// `accent`.
+  night,
+
+  /// [night] at a lower gain: the lines stay nearer `surface`.
+  quiet,
+
+  /// A light paper picture (the paper hero): the paper becomes `surface`, its darkest lines
+  /// `muted`.
+  paper,
+}
+
+/// A theme's wallpaper: its one drawing's colours (`assets/backdrops/wallpaper.svg`), each read
+/// from the picture the drawing replaced.
+@immutable
+class OoWallpaper {
+  const OoWallpaper({
+    required this.centre,
+    required this.middle,
+    required this.edge,
+    required this.grid,
+    required this.circle,
+    required this.line,
+    required this.ring,
+    required this.dot,
+    required this.rule,
+    required this.label,
+  });
+
+  /// The background's radial gradient, from its brightest point out.
+  final Color centre;
+  final Color middle;
+  final Color edge;
+
+  /// The fine grid, the large circles, the graph's lines, the rings around its nodes and their
+  /// dots.
+  final Color grid;
+  final Color circle;
+  final Color line;
+  final Color ring;
+  final Color dot;
+
+  /// The label's rule and text.
+  final Color rule;
+  final Color label;
+
+  /// Every colour it paints, for the panel contrast test.
+  List<Color> get colours => [
+    centre,
+    middle,
+    edge,
+    grid,
+    circle,
+    line,
+    ring,
+    dot,
+    rule,
+    label,
+  ];
+}
+
+/// The opacity of the `surface` panel that holds text over art (`OoHero`, `OoBackdrop`).
+const ooArtPanelOpacity = 0.92;
+
+/// The colours of one Outer Office theme, read with [OoTokens.of].
+///
+/// `border` separates surfaces and carries no meaning; everything a person must read uses
+/// `text`, `muted`, `accent` or a status colour, each at least 4.5:1 on `bg`, `surface`
+/// and `raised` (status colours on `surface`).
+@immutable
+class OoTokens extends ThemeExtension<OoTokens> {
+  const OoTokens({
+    required this.bg,
+    required this.surface,
+    required this.raised,
+    required this.text,
+    required this.muted,
+    required this.accent,
+    required this.border,
+    required this.success,
+    required this.warning,
+    required this.danger,
+    required this.series,
+    this.backdrop,
+    this.hero,
+    this.heroTint = OoArtTint.none,
+    this.decorated = true,
+  });
+
+  final Color bg;
+  final Color surface;
+  final Color raised;
+  final Color text;
+  final Color muted;
+  final Color accent;
+  final Color border;
+  final Color success;
+  final Color warning;
+  final Color danger;
+
+  /// The theme's wallpaper, painted only by `OoBackdrop`; null when it has none or it is
+  /// turned off.
+  final OoWallpaper? backdrop;
+
+  /// Eight categorical colours for charts, in a fixed order, each at least 3:1 on
+  /// `surface`. Neighbours, and the first colour beside any other (a pie's last slice
+  /// touches its first), stay apart for people with red-green colour blindness too.
+  final List<Color> series;
+
+  /// The art of the Overview hero, painted only by `OoHero`; null when it is turned off.
+  final OoArt? hero;
+
+  /// How [hero] is redrawn in this theme's colours ([heroMatrix]).
+  final OoArtTint heroTint;
+
+  /// Whether ornament is drawn: glows, decorative gradients, the wallpaper and the hero
+  /// art. False under high contrast ([highContrast]), where every one of them is flat.
+  final bool decorated;
+
+  /// Whether this is a dark theme: light text on a dark background.
+  bool get dark => bg.computeLuminance() < text.computeLuminance();
+
+  /// The two stops of the accent gradient (primary buttons, the wordmark), top first: a
+  /// step lighter than `accent` on a dark theme and a step darker on a light one, so `bg`
+  /// reads on both stops at least as well as on `accent`. Solid `accent` when not
+  /// [decorated].
+  List<Color> get accentGradient => !decorated
+      ? [accent, accent]
+      : dark
+      ? [_lightness(accent, 0.1), accent]
+      : [accent, _lightness(accent, -0.06)];
+
+  /// A decorative gradient from [from] to [to], or solid [from] when not [decorated].
+  List<Color> gradient(Color from, Color to) =>
+      decorated ? [from, to] : [from, from];
+
+  /// The duotone icon colours: the gradient's light and dark stops and the ink of details.
+  ({Color hi, Color lo, Color ink}) get duotone => dark
+      ? (
+          hi: _lightness(accent, 0.12),
+          lo: _lightness(accent, -0.14),
+          ink: _setLightness(accent, 0.12),
+        )
+      : (
+          hi: _lightness(accent, 0.24),
+          lo: accent,
+          ink: _setLightness(accent, 0.12),
+        );
+
+  /// The fill of a selected rail entry: `raised` washed with `accent`.
+  Color get selectedFill =>
+      Color.alphaBlend(accent.withValues(alpha: 0.16), raised);
+
+  /// A soft glow of [color] around a selected entry or the primary action; none when not
+  /// [decorated].
+  List<BoxShadow> glow(Color color, {double radius = 8}) => !decorated
+      ? const []
+      : [
+          BoxShadow(
+            color: color.withValues(alpha: dark ? 0.45 : 0.3),
+            blurRadius: radius,
+          ),
+        ];
+
+  /// The 4x5 colour matrix that redraws [hero] as [heroTint] says, or null to draw it as
+  /// it is.
+  List<double>? get heroMatrix {
+    // Rows map the picture's luminance (0-255) linearly from `low` at [from] to `high`
+    // at [to], channel by channel.
+    List<double> rows(Color from, Color to, double low, double high) {
+      List<double> row(double a, double b) {
+        final gain = (b - a) * 255 / (high - low);
+        return [
+          gain * 0.2126,
+          gain * 0.7152,
+          gain * 0.0722,
+          0,
+          a * 255 - gain * low,
+        ];
+      }
+
+      return [
+        ...row(from.r, to.r),
+        ...row(from.g, to.g),
+        ...row(from.b, to.b),
+        0,
+        0,
+        0,
+        1,
+        0,
+      ];
+    }
+
+    return switch (heroTint) {
+      OoArtTint.none => null,
+      OoArtTint.night => rows(surface, accent, 0, 255 / 1.6),
+      OoArtTint.quiet => rows(surface, accent, 0, 255 / 0.9),
+      OoArtTint.paper => rows(muted, surface, _paperLines, _paperTone),
+    };
+  }
+
+  /// The tokens of the nearest theme.
+  static OoTokens of(BuildContext context) =>
+      Theme.of(context).extension<OoTokens>() ?? _nightOps;
+
+  /// These tokens for a person who asked for more contrast: muted text becomes text,
+  /// separators become as visible as muted text, and nothing is [decorated].
+  OoTokens highContrast() => OoTokens(
+    bg: bg,
+    surface: surface,
+    raised: raised,
+    text: text,
+    muted: text,
+    accent: accent,
+    border: muted,
+    success: success,
+    warning: warning,
+    danger: danger,
+    series: series,
+    decorated: false,
+  );
+
+  /// The colour of a Mission or Session state; the state's name is always shown beside it.
+  Color stateColor(String state) => switch (state) {
+    'working' => success,
+    'blocked' || 'held' || 'verifying' => warning,
+    'stalled' || 'failed' || 'quarantined' => danger,
+    'parked' => accent,
+    _ => muted,
+  };
+
+  @override
+  OoTokens copyWith({
+    Color? bg,
+    Color? surface,
+    Color? raised,
+    Color? text,
+    Color? muted,
+    Color? accent,
+    Color? border,
+    Color? success,
+    Color? warning,
+    Color? danger,
+    List<Color>? series,
+    OoWallpaper? backdrop,
+    bool? decorated,
+    bool clearBackdrop = false,
+  }) => OoTokens(
+    bg: bg ?? this.bg,
+    surface: surface ?? this.surface,
+    raised: raised ?? this.raised,
+    text: text ?? this.text,
+    muted: muted ?? this.muted,
+    accent: accent ?? this.accent,
+    border: border ?? this.border,
+    success: success ?? this.success,
+    warning: warning ?? this.warning,
+    danger: danger ?? this.danger,
+    series: series ?? this.series,
+    backdrop: clearBackdrop ? null : backdrop ?? this.backdrop,
+    hero: clearBackdrop ? null : hero,
+    heroTint: heroTint,
+    decorated: decorated ?? this.decorated,
+  );
+
+  @override
+  OoTokens lerp(OoTokens? other, double t) {
+    if (other == null) return this;
+    Color mix(Color a, Color b) => Color.lerp(a, b, t)!;
+    return OoTokens(
+      bg: mix(bg, other.bg),
+      surface: mix(surface, other.surface),
+      raised: mix(raised, other.raised),
+      text: mix(text, other.text),
+      muted: mix(muted, other.muted),
+      accent: mix(accent, other.accent),
+      border: mix(border, other.border),
+      success: mix(success, other.success),
+      warning: mix(warning, other.warning),
+      danger: mix(danger, other.danger),
+      series: [
+        for (var i = 0; i < series.length && i < other.series.length; i++)
+          mix(series[i], other.series[i]),
+      ],
+      backdrop: t < 0.5 ? backdrop : other.backdrop,
+      hero: t < 0.5 ? hero : other.hero,
+      heroTint: t < 0.5 ? heroTint : other.heroTint,
+      // A change into or out of high contrast draws no ornament on the way.
+      decorated: decorated && other.decorated,
+    );
+  }
+}
+
+const _mapHero = OoArt([
+  OoArtFile('assets/heroes/map-940.jpg', 940, 278),
+  OoArtFile('assets/heroes/map-2560.jpg', 2560, 757),
+  OoArtFile('assets/heroes/map-3840.jpg', 3840, 1136),
+]);
+const _skylineHero = OoArt([
+  OoArtFile('assets/heroes/skyline-774.jpg', 774, 278),
+  OoArtFile('assets/heroes/skyline-2560.jpg', 2560, 919),
+  OoArtFile('assets/heroes/skyline-3840.jpg', 3840, 1379),
+]);
+const _paperHero = OoArt([
+  OoArtFile('assets/heroes/paper-940.jpg', 940, 278),
+  OoArtFile('assets/heroes/paper-1536.jpg', 1536, 454),
+  OoArtFile('assets/heroes/paper-2560.jpg', 2560, 757),
+  OoArtFile('assets/heroes/paper-3840.jpg', 3840, 1135),
+]);
+
+// The design kit's tokens. Where a kit colour fell below WCAG AA where text is drawn with
+// it (`test/theme_test.dart`), only its HSL lightness moved, by the smallest 1% step that
+// passes. The series take the accent first where it has enough chroma to name a series,
+// then hues ordered so that neighbours differ in colour-blind simulations too.
+const _nightOps = OoTokens(
+  bg: Color(0xFF07111B),
+  surface: Color(0xFF0D1C28),
+  raised: Color(0xFF142A39),
+  text: Color(0xFFF1E9D8),
+  muted: Color(0xFF9BAEBB),
+  accent: Color(0xFFD6A958),
+  border: Color(0xFF24404E),
+  success: Color(0xFF32C995),
+  warning: Color(0xFFE9A845),
+  danger: Color(0xFFD8595C),
+  backdrop: OoWallpaper(
+    centre: Color(0xFF0B2230),
+    middle: Color(0xFF091B29),
+    edge: Color(0xFF06121D),
+    grid: Color(0xFF0A1D2A),
+    circle: Color(0xFF102432),
+    line: Color(0xFF102432),
+    ring: Color(0xFF172C39),
+    dot: Color(0xFF806E46),
+    rule: Color(0xFF806E46),
+    label: Color(0xFF7D745E),
+  ),
+  hero: _mapHero,
+  series: [
+    Color(0xFFD6A958), // accent
+    Color(0xFF3987E5), // blue
+    Color(0xFFC44608), // orange
+    Color(0xFFA298FE), // violet
+    Color(0xFF069468), // aqua
+    Color(0xFFA468C2), // purple
+    Color(0xFF5BC5FA), // sky
+    Color(0xFFD55181), // magenta
+  ],
+);
+
+const _blackOps = OoTokens(
+  bg: Color(0xFF080A0D),
+  surface: Color(0xFF14191F),
+  raised: Color(0xFF1E252E),
+  text: Color(0xFFF0F2F2),
+  muted: Color(0xFF9BA4AC),
+  accent: Color(0xFFCBD1D0),
+  border: Color(0xFF323941),
+  success: Color(0xFF65C59D),
+  warning: Color(0xFFE1B76C),
+  danger: Color(0xFFDD6A6A),
+  backdrop: OoWallpaper(
+    centre: Color(0xFF12151C),
+    middle: Color(0xFF0F1217),
+    edge: Color(0xFF0B0C10),
+    grid: Color(0xFF0F1217),
+    circle: Color(0xFF16191E),
+    line: Color(0xFF16191E),
+    ring: Color(0xFF1D1F25),
+    dot: Color(0xFF73767B),
+    rule: Color(0xFF73767B),
+    label: Color(0xFF797C81),
+  ),
+  hero: _mapHero,
+  heroTint: OoArtTint.quiet,
+  series: [
+    Color(0xFF3987E5), // blue
+    Color(0xFFD95926), // orange
+    Color(0xFF4EC494), // aqua
+    Color(0xFF9A6502), // yellow
+    Color(0xFFF56E9C), // magenta
+    Color(0xFF008300), // green
+    Color(0xFFA5CF45), // lime
+    Color(0xFFDE9FFE), // purple
+  ],
+);
+
+const _dusk = OoTokens(
+  bg: Color(0xFF180E17),
+  surface: Color(0xFF281723),
+  raised: Color(0xFF3A222D),
+  text: Color(0xFFFFF0E0),
+  muted: Color(0xFFC7AAB1),
+  accent: Color(0xFFECAC70),
+  border: Color(0xFF624048),
+  success: Color(0xFF6DCCA5),
+  warning: Color(0xFFF1BA69),
+  danger: Color(0xFFEC616E),
+  backdrop: OoWallpaper(
+    centre: Color(0xFF341E21),
+    middle: Color(0xFF2A1A21),
+    edge: Color(0xFF191421),
+    grid: Color(0xFF2B1A22),
+    circle: Color(0xFF342229),
+    line: Color(0xFF342329),
+    ring: Color(0xFF3C2B31),
+    dot: Color(0xFF9A714C),
+    rule: Color(0xFF9A714C),
+    label: Color(0xFF957865),
+  ),
+  hero: _skylineHero,
+  series: [
+    Color(0xFFECAC70), // accent
+    Color(0xFF3987E5), // blue
+    Color(0xFF018059), // aqua
+    Color(0xFFA298FE), // violet
+    Color(0xFFD55181), // magenta
+    Color(0xFF46B2E6), // sky
+    Color(0xFF729405), // lime
+    Color(0xFFA468C2), // purple
+  ],
+);
+
+const _classic = OoTokens(
+  bg: Color(0xFFE6D6BB),
+  surface: Color(0xFFF5E8D2),
+  raised: Color(0xFFFFF4DF),
+  text: Color(0xFF30291F),
+  muted: Color(0xFF635B4F),
+  accent: Color(0xFF76582C),
+  border: Color(0xFFC4AB85),
+  success: Color(0xFF367253),
+  warning: Color(0xFF915D1D),
+  danger: Color(0xFF9F3D34),
+  backdrop: OoWallpaper(
+    centre: Color(0xFF554430),
+    middle: Color(0xFF493B2A),
+    edge: Color(0xFF362C22),
+    grid: Color(0xFF4B3C2B),
+    circle: Color(0xFF554634),
+    line: Color(0xFF544534),
+    ring: Color(0xFF5F4F3D),
+    dot: Color(0xFF9F8453),
+    rule: Color(0xFF9F8453),
+    label: Color(0xFF9D8664),
+  ),
+  hero: _paperHero,
+  heroTint: OoArtTint.paper,
+  series: [
+    Color(0xFF7A6DF5), // violet
+    Color(0xFFD6551C), // orange
+    Color(0xFF0B8C8C), // teal
+    Color(0xFF9F0117), // red
+    Color(0xFF02587C), // sky
+    Color(0xFF689001), // lime
+    Color(0xFFAB446E), // magenta
+    Color(0xFF026502), // green
+  ],
+);
+
+const _light = OoTokens(
+  bg: Color(0xFFF1F3F1),
+  surface: Color(0xFFFFFFFF),
+  raised: Color(0xFFEAF0F1),
+  text: Color(0xFF152530),
+  muted: Color(0xFF5C6F7B),
+  accent: Color(0xFF2A6D84),
+  border: Color(0xFFD4DFE2),
+  success: Color(0xFF258262),
+  warning: Color(0xFF9D691A),
+  danger: Color(0xFFBA4F55),
+  backdrop: OoWallpaper(
+    centre: Color(0xFFEFE9DB),
+    middle: Color(0xFFECE6D9),
+    edge: Color(0xFFE8E2D6),
+    grid: Color(0xFFECE6D9),
+    circle: Color(0xFFE5DFD1),
+    line: Color(0xFFE4DED0),
+    ring: Color(0xFFDBD6C8),
+    dot: Color(0xFFB3997B),
+    rule: Color(0xFFB3997B),
+    label: Color(0xFFA79277),
+  ),
+  hero: _paperHero,
+  series: [
+    Color(0xFF3481E0), // blue
+    Color(0xFFEB6834), // orange
+    Color(0xFF026502), // green
+    Color(0xFFD36992), // magenta
+    Color(0xFF9F0117), // red
+    Color(0xFF06A572), // aqua
+    Color(0xFF7B289D), // purple
+    Color(0xFFA56F00), // yellow
+  ],
+);
+
+// Red File has no wallpaper; its hero is the map in its own crimson.
+const _redFile = OoTokens(
+  bg: Color(0xFF17090E),
+  surface: Color(0xFF240F18),
+  raised: Color(0xFF351725),
+  text: Color(0xFFFCEDEF),
+  muted: Color(0xFFC9A4AF),
+  accent: Color(0xFFE65960),
+  border: Color(0xFF622A3C),
+  success: Color(0xFF5ECEA0),
+  warning: Color(0xFFE6B04C),
+  danger: Color(0xFFFF6C72),
+  hero: _mapHero,
+  heroTint: OoArtTint.night,
+  series: [
+    Color(0xFFE65960), // accent
+    Color(0xFF3987E5), // blue
+    Color(0xFF59CE9D), // aqua
+    Color(0xFF6557B7), // violet
+    Color(0xFF50BBF0), // sky
+    Color(0xFFE3B738), // gold
+    Color(0xFF199E9E), // teal
+    Color(0xFFDE9FFE), // purple
+  ],
+);
+
+// The luminance (0-255) of the paper hero's darkest line and of its paper (the median).
+const _paperLines = 70.0;
+const _paperTone = 240.0;
+
+/// [color] with its HSL lightness moved by [delta], kept within 0–1.
+Color _lightness(Color color, double delta) {
+  final hsl = HSLColor.fromColor(color);
+  return hsl.withLightness((hsl.lightness + delta).clamp(0, 1)).toColor();
+}
+
+/// [color] at HSL [lightness], hue and saturation kept.
+Color _setLightness(Color color, double lightness) =>
+    HSLColor.fromColor(color).withLightness(lightness).toColor();

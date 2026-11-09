@@ -1,0 +1,90 @@
+//! What M does when a provider usage limit stops a Session.
+
+use serde::{Deserialize, Serialize};
+
+/// How long to park a Session when the provider reports a limit without a reset time.
+pub const DEFAULT_LIMIT_FALLBACK_SECS: u64 = 30 * 60;
+
+/// An Operation's response to a provider limit (`on_limit`).
+#[non_exhaustive]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    guatiao::ToValue,
+    guatiao::FromValue,
+    guatiao::Schema,
+)]
+#[serde(rename_all = "lowercase")]
+#[map(rename_all = "lowercase")]
+pub enum OnLimit {
+    /// Move the Session to another account of its pools that has headroom: the same provider
+    /// Session where its history goes with it (Claude's environment credentials), else a new
+    /// attempt with a hand-off. Without a pool account to move to, the same as `Wait`.
+    #[default]
+    #[schema(label = "Move to another account in its pools")]
+    Rotate,
+    /// Park the Session and resume the same provider Session when the limit resets.
+    #[schema(label = "Wait for the limit to reset")]
+    Wait,
+    /// Post the next qualified Agent as a new attempt; park only if there is none.
+    #[schema(label = "Hand over to the next qualified Agent")]
+    Backup,
+}
+
+impl OnLimit {
+    /// The configuration spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rotate => "rotate",
+            Self::Wait => "wait",
+            Self::Backup => "backup",
+        }
+    }
+}
+
+/// When a Session stopped at `now` (Unix seconds) may resume.
+///
+/// A reset time in the future is honoured plus `grace_secs`, so the resumed Session does not
+/// race the provider's own clock. A missing or already-past one cannot be trusted (clock
+/// skew, or a limit that outlived its stated reset), so the Session waits `fallback_secs`
+/// rather than retrying in a loop.
+pub fn parked_until(now: i64, resets_at: Option<i64>, fallback_secs: u64, grace_secs: i64) -> i64 {
+    match resets_at {
+        Some(reset) if reset > now => reset.saturating_add(grace_secs),
+        _ => now.saturating_add(i64::try_from(fallback_secs).unwrap_or(i64::MAX)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_future_reset_is_honoured_with_a_grace() {
+        assert_eq!(parked_until(1_000, Some(5_000), 60, 15), 5_000 + 15);
+    }
+
+    #[test]
+    fn a_missing_or_past_reset_waits_the_fallback() {
+        assert_eq!(parked_until(1_000, None, 60, 15), 1_060);
+        assert_eq!(parked_until(1_000, Some(1_000), 60, 15), 1_060);
+        assert_eq!(parked_until(1_000, Some(10), 60, 15), 1_060);
+        assert_eq!(parked_until(i64::MAX, None, 60, 15), i64::MAX);
+    }
+
+    #[test]
+    fn the_policy_defaults_to_rotating_and_parses_by_name() {
+        assert_eq!(OnLimit::default(), OnLimit::Rotate);
+        let parsed: OnLimit = serde_json::from_str("\"backup\"").unwrap();
+        assert_eq!(parsed, OnLimit::Backup);
+        let parsed: OnLimit = serde_json::from_str("\"wait\"").unwrap();
+        assert_eq!(parsed, OnLimit::Wait);
+        assert!(serde_json::from_str::<OnLimit>("\"retry\"").is_err());
+    }
+}

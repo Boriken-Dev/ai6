@@ -1,0 +1,5360 @@
+//! The file-backed Registry store: the brief queue, leases, Station check-ins, the
+//! Headquarters lease, audit records and access tokens.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use fs2::FileExt;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::bounds::TimeLimit;
+
+use crate::bounds::Limit;
+use crate::directorates::m::identity::{MissionId, SessionId};
+use crate::directorates::m::placement::ResourceLimits;
+use crate::directorates::m::roster::AgentRole;
+use crate::directorates::m::vetting::{Vetting, is_invisible};
+use crate::directorates::registry::bona_fides::{self, Provenance, proposal_provenance};
+use crate::directorates::registry::cables::{Cable, CableError, CableState};
+use crate::directorates::registry::limits::{ProposalLimits, RegistryLimits, StationLimits};
+use crate::directorates::registry::mission_ids::{self, MissionBook, MissionEntry, MissionHandle};
+use crate::directorates::registry::sources::{SOURCE_BRIEF_PREFIX, settle_report};
+use crate::directorates::registry::timeline::{TimelineEvent, record_event_locked};
+
+const BRIEF_VERSION: u32 = 1;
+/// Default duration for a file-backed Registry claim.
+pub const DEFAULT_LEASE: Duration = Duration::from_secs(60);
+
+/// One queued brief with a bounded, versioned file representation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Brief {
+    /// Human-readable task title.
+    pub title: String,
+    /// Additional task instructions.
+    #[serde(default)]
+    pub body: String,
+    /// What the brief is called where it came from: a tracker's item, a review. Not the
+    /// Mission's ID.
+    #[serde(default = "default_id")]
+    pub id: String,
+    /// The Mission's UID, minted where the brief entered ([`MissionEntry`]): its Registry key,
+    /// and its Mission's ID, for its whole life. A brief dropped into the queue by hand has
+    /// none and goes by `{source}--{id}`, or by the Registry key it names here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_id: Option<String>,
+    /// What the Mission is called: the handle the rule gave where the brief entered, or the
+    /// one it was renamed to. The Registry keeps it current; no digest of the brief covers it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+    /// A name to show beside the handle, for a brief whose `title` is not one: an issue's
+    /// title, one line and cut. Untrusted data, never part of [`Brief::prompt`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Intake source name.
+    #[serde(default = "default_source")]
+    pub source: String,
+    /// Operation id, name or alias.
+    pub operation: Option<String>,
+    /// Explicit Agent identity, when assigned.
+    pub agent: Option<String>,
+    /// Requested Agent role, when not explicitly assigned.
+    pub role: Option<String>,
+    /// Requested Agent capabilities.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Stations the Mission is limited to. It can only narrow the Operation's `stations`
+    /// list, never widen it; empty adds no limit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stations: Vec<String>,
+    /// Higher values sort first.
+    #[serde(default)]
+    pub priority: i64,
+    /// Optional source URL.
+    pub url: Option<String>,
+    /// Source-specific metadata.
+    #[serde(default)]
+    pub data: BTreeMap<String, serde_json::Value>,
+    /// ISO 8601 creation time used for stable intake ordering.
+    #[serde(default)]
+    pub created: String,
+    /// Brief contract version.
+    #[serde(default = "default_version")]
+    pub version: u32,
+    /// Where the brief came from, as AI6 recorded it where it entered. The Registry keeps it
+    /// apart from the record and never reads this field from a stored brief; `None` from the
+    /// Registry means it holds none, and the brief was dropped into the queue by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Provenance>,
+}
+
+impl Brief {
+    /// Filesystem-safe key within the Registry: the Mission's UID.
+    pub fn key(&self) -> String {
+        match &self.mission_id {
+            Some(id) => safe_component(id),
+            None => format!(
+                "{}--{}",
+                safe_component(&self.source),
+                safe_component(&self.id)
+            ),
+        }
+    }
+
+    /// Gives the brief the Mission the Registry allotted it.
+    pub(super) fn enter_as(&mut self, mission: MissionHandle) {
+        self.mission_id = Some(mission.mission_id);
+        self.handle = Some(mission.handle);
+    }
+
+    /// What the Mission shows as its name: its handle, else its key.
+    pub fn shown_handle(&self) -> String {
+        self.handle.clone().unwrap_or_else(|| self.key())
+    }
+
+    /// The Mission's key and the handle it shows.
+    pub fn mission_handle(&self) -> MissionHandle {
+        MissionHandle::new(self.key(), self.shown_handle())
+    }
+
+    /// What to show beside the handle: [`Brief::name`], else the title, on one line and
+    /// within `bytes`. Data for a person to read; it goes in no prompt.
+    pub fn display_name(&self, bytes: usize) -> String {
+        one_line_within(self.name.as_deref().unwrap_or(&self.title), bytes)
+    }
+
+    /// The complete task instruction for an Agent.
+    pub fn prompt(&self) -> String {
+        let mut parts = Vec::with_capacity(3);
+        let title = self.title.trim();
+        let body = self.body.trim();
+        if !title.is_empty() {
+            parts.push(title.to_owned());
+        }
+        if !body.is_empty() {
+            parts.push(body.to_owned());
+        }
+        if let Some(url) = self
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+        {
+            parts.push(format!("Source: {url}"));
+        }
+        parts.join("\n\n")
+    }
+
+    pub(super) fn validate(&self) -> io::Result<()> {
+        if self.title.trim().is_empty() {
+            return Err(invalid_data("a brief needs a title"));
+        }
+        if self.version > BRIEF_VERSION {
+            return Err(invalid_data(format!(
+                "brief version {} is newer than this reader ({BRIEF_VERSION})",
+                self.version
+            )));
+        }
+        if self.id.is_empty() || self.source.is_empty() {
+            return Err(invalid_data("brief id and source must be non-empty"));
+        }
+        if let Some(id) = &self.mission_id {
+            validate_registry_key(id).map_err(|error| invalid_data(error.to_string()))?;
+        }
+        if let Some(handle) = &self.handle
+            && (self.mission_id.is_none() || !mission_ids::valid_handle(handle))
+        {
+            return Err(invalid_data(
+                "a brief's handle needs a Mission ID and the handle character set",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// `text` on one line for a person to read: control characters become spaces, characters that
+/// show nothing or reorder what is shown go, and it is cut to `bytes` at a character.
+pub(super) fn one_line_within(text: &str, bytes: usize) -> String {
+    let line: String = text
+        .chars()
+        .filter(|character| !is_invisible(*character))
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let line = line.trim();
+    if line.len() <= bytes {
+        return line.to_owned();
+    }
+    let mut end = bytes;
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    line[..end].trim_end().to_owned()
+}
+
+/// An Agent-authored Mission brief waiting for M's authorization.
+///
+/// Proposals are held outside `new/` and are never visible to the scheduler until an
+/// M-controlled path promotes them. The proposal identity is derived from its parent
+/// Mission, provider Session and idempotency key.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MissionProposal {
+    /// Stable proposal identity derived from the authenticated Session and retry key.
+    pub id: String,
+    /// Operation that owns the parent Mission and proposed work.
+    pub operation_id: String,
+    /// Parent Mission whose coordinator authored this proposal.
+    pub parent_mission_id: MissionId,
+    /// Authenticated Agent identity supplied by AI6, not by the proposal body.
+    pub proposer_agent_id: String,
+    /// Provider-issued Session bound to the authenticated MCP endpoint.
+    pub proposer_session_id: SessionId,
+    /// Proposed child Mission brief.
+    pub brief: Brief,
+    /// Unix timestamp when the proposal was first stored.
+    pub created_at: f64,
+    /// What M's vetting found, once it has looked; `None` until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vetting: Option<Vetting>,
+    /// The parent Mission's role, recorded by AI6 when the proposal is submitted; a class
+    /// authorisation's roles are matched against it, never against the role proposed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_role: Option<String>,
+}
+
+impl MissionProposal {
+    /// Builds a Mission proposal tied to the caller's parent Mission and provider Session.
+    ///
+    /// `idempotency_key` is scoped to the parent Mission and Session. The proposed brief's
+    /// Operation is set from `operation_id`; its source and ID are reserved by AI6.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` when the identity, retry key or brief is invalid, or the key is
+    /// longer than `limits.idempotency_key_bytes`.
+    pub fn try_new(
+        operation_id: impl Into<String>,
+        parent_mission_id: MissionId,
+        proposer_agent_id: impl Into<String>,
+        proposer_session_id: SessionId,
+        idempotency_key: &str,
+        mut brief: Brief,
+        limits: &ProposalLimits,
+    ) -> io::Result<Self> {
+        let operation_id = operation_id.into();
+        let proposer_agent_id = proposer_agent_id.into();
+        if idempotency_key.is_empty()
+            || !limits.idempotency_key_bytes.allows(idempotency_key.len())
+            || idempotency_key.chars().any(char::is_control)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "proposal idempotency key is empty, too long, or contains controls",
+            ));
+        }
+        validate_registry_key(&operation_id)?;
+        validate_registry_key(&proposer_agent_id)?;
+        brief.validate()?;
+        if brief.agent.is_some() && brief.role.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a proposed brief cannot select both an Agent and a role",
+            ));
+        }
+        let mut digest = Sha256::new();
+        for component in [
+            operation_id.as_bytes(),
+            parent_mission_id.as_str().as_bytes(),
+            proposer_session_id.as_str().as_bytes(),
+            idempotency_key.as_bytes(),
+        ] {
+            digest.update((component.len() as u64).to_be_bytes());
+            digest.update(component);
+        }
+        let id = format!("proposal-{}", hex_digest(&digest.finalize()));
+        brief.operation = Some(operation_id.clone());
+        brief.source = "ai6-agent-proposal".to_owned();
+        brief.id = id.clone();
+        // Chosen when an approval promotes it.
+        brief.mission_id = None;
+        // Set when an approval promotes it, from this record's authenticated proposer.
+        brief.provenance = None;
+        Ok(Self {
+            id,
+            operation_id,
+            parent_mission_id,
+            proposer_agent_id,
+            proposer_session_id,
+            brief,
+            created_at: 0.0,
+            vetting: None,
+            parent_role: None,
+        })
+    }
+
+    /// Records the parent Mission's role, as AI6 knows it.
+    #[must_use]
+    pub fn with_parent_role(mut self, role: Option<String>) -> Self {
+        self.parent_role = role;
+        self
+    }
+
+    pub(super) fn validate(&self) -> io::Result<()> {
+        validate_registry_key(&self.id)?;
+        validate_registry_key(&self.operation_id)?;
+        validate_registry_key(&self.proposer_agent_id)?;
+        self.brief.validate()?;
+        if self.brief.operation.as_deref() != Some(self.operation_id.as_str())
+            || self.brief.source != "ai6-agent-proposal"
+            || self.brief.id != self.id
+            || self.brief.mission_id.is_some()
+            || self.brief.provenance.is_some()
+            || !self.created_at.is_finite()
+            || self.created_at < 0.0
+            || self.parent_role.as_deref().is_some_and(|role| {
+                role.is_empty() || role.len() > 128 || role.contains(char::is_control)
+            })
+        {
+            return Err(invalid_data("Mission proposal record is invalid"));
+        }
+        Ok(())
+    }
+}
+
+/// The scopes an audit record's `resource` may use.
+const AUDIT_RESOURCE_KINDS: [&str; 5] = [
+    "station:",
+    "config:",
+    "operation:",
+    "mission:",
+    "compartment:",
+];
+
+/// Metadata-only audit event stored in the shared file-backed Registry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditRecord {
+    /// Unique file-safe event identity.
+    pub id: String,
+    /// Authenticated actor identity supplied by the gateway's Directory.
+    pub actor: String,
+    /// Bounded action name such as `mission.create`.
+    pub action: String,
+    /// Operation that authorized the action.
+    pub operation: String,
+    /// Explicit resource beside the Operation: a Station (`station:<id>`), a configuration
+    /// record (`config:roster`), or what a crossing touched (`operation:<id>`, `mission:<id>`,
+    /// `compartment:<id>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
+    /// Safe identifier for the affected resource; never a prompt or payload.
+    pub target: String,
+    /// Unix timestamp in seconds.
+    pub at: f64,
+}
+
+impl AuditRecord {
+    pub(super) fn validate(&self) -> io::Result<()> {
+        if self.id.len() > 128 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "audit ID exceeds 128 bytes",
+            ));
+        }
+        validate_registry_key(&self.id)?;
+        validate_audit_text(&self.actor, 256, "actor")?;
+        validate_audit_action(&self.action)?;
+        if self.operation.is_empty() {
+            if self.resource.as_deref().is_none_or(str::is_empty) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "audit entry needs an Operation or resource scope",
+                ));
+            }
+        } else {
+            validate_audit_text(&self.operation, 256, "operation")?;
+        }
+        if let Some(resource) = &self.resource {
+            validate_audit_text(resource, 512, "resource")?;
+            if !AUDIT_RESOURCE_KINDS
+                .iter()
+                .any(|kind| resource.starts_with(kind))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "audit resource must use a supported scope",
+                ));
+            }
+        }
+        validate_audit_text(&self.target, 512, "target")?;
+        if !self.at.is_finite() || self.at <= 0.0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "audit timestamp must be finite and positive",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A station's renewable hold on one claimed brief.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct Lease {
+    pub(super) key: String,
+    pub(super) station: String,
+    pub(super) expires: f64,
+    pub(super) attempt: u32,
+    pub(super) meta: BTreeMap<String, serde_json::Value>,
+}
+
+impl PartialEq for Lease {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+            && self.station == other.station
+            && self.expires == other.expires
+            && self.attempt == other.attempt
+    }
+}
+
+impl Lease {
+    /// Returns the filesystem-safe brief key.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Returns the station that owns this lease.
+    pub fn station(&self) -> &str {
+        &self.station
+    }
+
+    /// Returns the wall-clock expiry as Unix seconds.
+    pub fn expires(&self) -> f64 {
+        self.expires
+    }
+
+    /// Returns the number of leased attempts for this brief.
+    pub fn attempt(&self) -> u32 {
+        self.attempt
+    }
+
+    /// Returns the assignment metadata shared with other Registry users.
+    pub fn meta(&self) -> &BTreeMap<String, serde_json::Value> {
+        &self.meta
+    }
+}
+
+/// A station's latest shared Registry check-in, with its scheduling attributes.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
+pub struct StationRecord {
+    #[serde(flatten)]
+    pub(super) info: BTreeMap<String, serde_json::Value>,
+    pub(super) station: String,
+    pub(super) seen: f64,
+}
+
+/// A validated setting that can be changed for one Station while it is running.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct StationSettings {
+    pub(super) station: String,
+    pub(super) max_concurrent_missions: usize,
+    #[serde(flatten)]
+    pub(super) resource_limits: ResourceLimits,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StationSettingsFile {
+    station: String,
+    max_concurrent_missions: usize,
+    min_free_memory_mb: u64,
+    max_cpu_percent: u32,
+}
+
+impl StationSettings {
+    /// Creates settings with a Mission capacity of at least 1 and the default
+    /// [`ResourceLimits`]. The Registry refuses to store a capacity above its
+    /// `[registry.limits.stations] mission_capacity`.
+    pub fn try_new(station: impl Into<String>, max_concurrent_missions: usize) -> io::Result<Self> {
+        let station = station.into();
+        validate_station_id(&station)?;
+        if max_concurrent_missions == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Station Mission capacity must be at least 1",
+            ));
+        }
+        Ok(Self {
+            station,
+            max_concurrent_missions,
+            resource_limits: ResourceLimits::default(),
+        })
+    }
+
+    /// Replaces when the Station and its Theaters are too short of resources for new
+    /// Missions. `max_cpu_percent` above 100 is refused: no CPU is busier than that.
+    pub fn with_resource_limits(mut self, limits: ResourceLimits) -> io::Result<Self> {
+        if limits.max_cpu_percent > 100 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Station max_cpu_percent must be between 0 and 100",
+            ));
+        }
+        self.resource_limits = limits;
+        Ok(self)
+    }
+
+    /// Returns when the Station and its Theaters take no new Missions.
+    pub fn resource_limits(&self) -> ResourceLimits {
+        self.resource_limits
+    }
+
+    /// Returns the Station identity this setting belongs to.
+    pub fn station(&self) -> &str {
+        &self.station
+    }
+
+    /// Returns the Station's maximum number of simultaneous provider Sessions.
+    pub fn max_concurrent_missions(&self) -> usize {
+        self.max_concurrent_missions
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(super) struct StationRecordFile {
+    #[serde(flatten)]
+    info: BTreeMap<String, serde_json::Value>,
+    station: String,
+    seen: f64,
+}
+
+impl StationRecordFile {
+    pub(super) fn into_station_record(self) -> io::Result<StationRecord> {
+        validate_station_id(&self.station)?;
+        if !self.seen.is_finite() {
+            return Err(invalid_data("invalid station check-in time"));
+        }
+        Ok(StationRecord {
+            info: self.info,
+            station: self.station,
+            seen: self.seen,
+        })
+    }
+}
+
+impl StationRecord {
+    /// Returns the stable station identity.
+    pub fn station(&self) -> &str {
+        &self.station
+    }
+
+    /// Returns the wall-clock check-in time as Unix seconds.
+    pub fn seen(&self) -> f64 {
+        self.seen
+    }
+
+    /// Returns the station metadata other than its identity and check-in time.
+    pub fn info(&self) -> &BTreeMap<String, serde_json::Value> {
+        &self.info
+    }
+}
+
+/// The current Headquarters lease, whether live or expired.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
+pub struct HeadquartersLease {
+    pub(super) station: String,
+    pub(super) expires: f64,
+    pub(super) term: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HeadquartersLeaseFile {
+    station: String,
+    expires: f64,
+    term: u64,
+}
+
+impl HeadquartersLeaseFile {
+    fn into_lease(self) -> io::Result<HeadquartersLease> {
+        validate_station_id(&self.station)?;
+        if !self.expires.is_finite() {
+            return Err(invalid_data("invalid Headquarters lease expiry"));
+        }
+        Ok(HeadquartersLease {
+            station: self.station,
+            expires: self.expires,
+            term: self.term,
+        })
+    }
+}
+
+impl HeadquartersLease {
+    /// Returns the election term: it grows by one each time a different Station takes the
+    /// lease and never repeats, so it orders Headquarters holders.
+    pub fn term(&self) -> u64 {
+        self.term
+    }
+
+    /// Returns the station that holds or last held the Headquarters lease.
+    pub fn station(&self) -> &str {
+        &self.station
+    }
+
+    /// Returns the lease expiry as Unix seconds.
+    pub fn expires(&self) -> f64 {
+        self.expires
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LeaseRecord {
+    station: String,
+    expires: f64,
+    attempt: u32,
+    #[serde(default)]
+    meta: BTreeMap<String, serde_json::Value>,
+}
+
+impl LeaseRecord {
+    fn from_lease(lease: &Lease) -> Self {
+        Self {
+            station: lease.station.clone(),
+            expires: lease.expires,
+            attempt: lease.attempt,
+            meta: lease.meta.clone(),
+        }
+    }
+
+    fn into_lease(self, key: String) -> io::Result<Lease> {
+        if self.station.trim().is_empty() || !self.expires.is_finite() {
+            return Err(invalid_data("invalid Registry lease"));
+        }
+        Ok(Lease {
+            key,
+            station: self.station,
+            expires: self.expires,
+            attempt: self.attempt,
+            meta: self.meta,
+        })
+    }
+}
+
+/// Result of recovering a Registry lease after its owner stopped renewing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LeaseRecovery {
+    /// The brief was returned to `new/` for another attempt.
+    Requeued,
+    /// The attempt limit was reached and the brief was filed in `failed/`.
+    Failed,
+}
+
+/// The Registry kept in one directory every Station shares: a
+/// [`RegistryBackend`](super::backend::RegistryBackend).
+///
+/// Records are JSON files written atomically under a directory lock: briefs move through
+/// `new/`, `claimed/`, `done/` and `failed/`, with leases in `leases/`. Stations sharing it
+/// need synchronized clocks, since leases expire on wall-clock time.
+#[derive(Debug, Clone)]
+pub struct FileRegistry {
+    pub(super) root: PathBuf,
+    pub(super) limits: Arc<RegistryLimits>,
+}
+
+impl FileRegistry {
+    /// Opens a Registry directory without creating or changing it, with the default
+    /// [`RegistryLimits`].
+    pub fn open(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            limits: Arc::default(),
+        }
+    }
+
+    /// The same Registry, applying `limits`.
+    #[must_use]
+    pub fn with_limits(mut self, limits: RegistryLimits) -> Self {
+        self.limits = Arc::new(limits);
+        self
+    }
+
+    /// Writes `bytes` to `path` atomically, retrying a refused rename for
+    /// `[registry.limits.files] rename_retry`.
+    pub(super) fn write_atomic(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        write_atomic_within(path, bytes, self.limits.files.rename_retry)
+    }
+
+    /// Takes the Registry's directory lock, waiting up to `[registry.limits.files]
+    /// lock_wait`.
+    pub(super) fn lock(&self) -> io::Result<File> {
+        registry_lock(&self.root, self.limits.files.lock_wait)
+    }
+
+    /// Returns the configured Registry root.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drop_brief(&self, key: &str, record: &str) {
+        let queue = self.root.join("new");
+        fs::create_dir_all(&queue).unwrap();
+        fs::write(queue.join(format!("{key}.json")), record).unwrap();
+    }
+
+    /// Allots under the Registry lock the caller holds.
+    pub(super) fn allot_locked(&self, entry: &MissionEntry) -> io::Result<MissionHandle> {
+        mission_ids::allot(&mut FileBook(self), entry, &self.limits.briefs)
+    }
+
+    fn book_entry_path(&self, name: &str) -> PathBuf {
+        self.root
+            .join("mission-ids")
+            .join("entries")
+            .join(format!("{}.json", mission_ids::book_digest(name)))
+    }
+
+    fn book_handle_path(&self, handle: &str) -> PathBuf {
+        self.root
+            .join("mission-ids")
+            .join("issued")
+            .join(format!("{}.json", mission_ids::folded(handle)))
+    }
+
+    fn read_issued(path: &Path) -> io::Result<Option<IssuedId>> {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let issued: IssuedId =
+            serde_json::from_slice(&bytes).map_err(|error| invalid_data(error.to_string()))?;
+        if !mission_ids::is_uid(&issued.mission_id) || !mission_ids::valid_handle(&issued.handle) {
+            return Err(invalid_data("invalid Mission handle record"));
+        }
+        Ok(Some(issued))
+    }
+
+    fn entered_id(&self, name: &str) -> io::Result<Option<MissionHandle>> {
+        let Some(issued) = Self::read_issued(&self.book_entry_path(name))? else {
+            return Ok(None);
+        };
+        if issued.entry.as_deref() != Some(name) {
+            return Err(invalid_data("Mission handle record names another entry"));
+        }
+        Ok(Some(MissionHandle::new(issued.mission_id, issued.handle)))
+    }
+
+    /// What the book says `handle` was given to, current or former, compared without case.
+    fn issued_handle(&self, handle: &str) -> io::Result<Option<IssuedId>> {
+        if !mission_ids::valid_handle(handle) {
+            return Ok(None);
+        }
+        Self::read_issued(&self.book_handle_path(handle))
+    }
+
+    /// Sets the handle on every copy of the brief `key` the Registry holds, under the lock the
+    /// caller holds. What the brief says, and its provenance, stay as they were.
+    fn rehandle_locked(&self, key: &str, handle: &str) -> io::Result<()> {
+        for state in BRIEF_STATES {
+            let path = self.root.join(state).join(format!("{key}.json"));
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            let bytes = if state == "held" {
+                let mut held: super::vetting::HeldBrief = serde_json::from_slice(&bytes)
+                    .map_err(|error| invalid_data(error.to_string()))?;
+                held.brief.handle = Some(handle.to_owned());
+                serde_json::to_vec_pretty(&held).map_err(io::Error::other)?
+            } else {
+                let mut brief: Brief = serde_json::from_slice(&bytes)
+                    .map_err(|error| invalid_data(error.to_string()))?;
+                brief.handle = Some(handle.to_owned());
+                serde_json::to_vec_pretty(&brief).map_err(io::Error::other)?
+            };
+            self.write_atomic(&path, &bytes)?;
+        }
+        Ok(())
+    }
+
+    fn provenance_path(&self, key: &str) -> PathBuf {
+        self.root.join("provenance").join(format!("{key}.json"))
+    }
+
+    /// Keeps a brief's provenance beside the queue, or removes a stale one when it has none.
+    pub(super) fn keep_provenance(
+        &self,
+        key: &str,
+        provenance: Option<&Provenance>,
+    ) -> io::Result<()> {
+        let path = self.provenance_path(key);
+        match provenance {
+            Some(provenance) => self.write_atomic(
+                &path,
+                &serde_json::to_vec_pretty(provenance).map_err(io::Error::other)?,
+            ),
+            None => match fs::remove_file(path) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+                _ => Ok(()),
+            },
+        }
+    }
+
+    /// Sets `brief.provenance` from what the Registry keeps for it, if anything.
+    pub(super) fn attach_provenance(&self, brief: &mut Brief) {
+        let kept = fs::read(self.provenance_path(&brief.key()))
+            .ok()
+            .filter(|bytes| self.limits.briefs.provenance_bytes.allows(bytes.len()))
+            .and_then(|bytes| serde_json::from_slice::<Provenance>(&bytes).ok());
+        bona_fides::unseal(brief, kept);
+    }
+
+    /// Sets a finished brief's provenance from what the Registry kept for it in `state`.
+    pub(super) fn attach_spent_provenance(&self, state: &str, brief: &mut Brief) {
+        let kept = fs::read(
+            self.root
+                .join(state)
+                .join(format!("{}.provenance", brief.key())),
+        )
+        .ok()
+        .filter(|bytes| self.limits.briefs.provenance_bytes.allows(bytes.len()))
+        .and_then(|bytes| serde_json::from_slice::<Provenance>(&bytes).ok());
+        bona_fides::unseal(brief, kept);
+    }
+
+    /// Writes a brief record without its provenance, which goes beside it.
+    pub(super) fn write_brief(&self, path: &Path, brief: &Brief) -> io::Result<()> {
+        let (record, provenance) = bona_fides::seal(brief)?;
+        let bytes = serde_json::to_vec_pretty(&record).map_err(io::Error::other)?;
+        if !self.limits.briefs.record_bytes.allows(bytes.len()) {
+            return Err(invalid_data("brief exceeds the size limit"));
+        }
+        self.keep_provenance(&brief.key(), provenance.as_ref())?;
+        self.write_atomic(path, &bytes)
+    }
+
+    fn station_settings_path(&self, station: &str) -> PathBuf {
+        let digest = hex_digest(&Sha256::digest(station.as_bytes()));
+        self.root
+            .join("station-settings")
+            .join(format!("{digest}.json"))
+    }
+
+    fn scan_cables(&self) -> io::Result<Vec<Cable>> {
+        let directory = self.root.join("cables");
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut paths = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+            {
+                if !self.limits.cables.records.allows(paths.len() + 1) {
+                    return Err(invalid_data(format!(
+                        "Registry has more than {} Cable records",
+                        self.limits.cables.records
+                    )));
+                }
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        let mut cables = Vec::with_capacity(paths.len());
+        for path in paths {
+            match read_cable(&path, self.limits.cables.record_bytes) {
+                Ok(Some(cable)) => cables.push(cable),
+                Ok(None) => {}
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(cables)
+    }
+}
+
+/// One handle the file Registry gave, under `mission-ids/`: the Mission's UID, the handle as
+/// given, and the entry it was given for when that entry can come again.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IssuedId {
+    mission_id: String,
+    handle: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    entry: Option<String>,
+}
+
+/// The file Registry's handle book, used while the caller holds the Registry lock: a counter
+/// per Operation in `mission-ids/counters/`, every handle given, current or former, in
+/// `mission-ids/issued/` by its lower-case form, and the Mission and current handle of each
+/// repeatable entry in `mission-ids/entries/` by digest.
+struct FileBook<'a>(&'a FileRegistry);
+
+impl MissionBook for FileBook<'_> {
+    fn entered(&mut self, name: &str) -> io::Result<Option<MissionHandle>> {
+        self.0.entered_id(name)
+    }
+
+    fn holder(&mut self, handle: &str) -> io::Result<Option<String>> {
+        Ok(self
+            .0
+            .issued_handle(handle)?
+            .map(|issued| issued.mission_id))
+    }
+
+    fn entry_of(&mut self, handle: &str) -> io::Result<Option<String>> {
+        Ok(self
+            .0
+            .issued_handle(handle)?
+            .and_then(|issued| issued.entry))
+    }
+
+    fn next_number(&mut self, name: &str) -> io::Result<u64> {
+        let path = self.0.root.join("mission-ids").join("counters").join(name);
+        let last = match fs::read_to_string(&path) {
+            Ok(text) => text
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| invalid_data("invalid Mission counter"))?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error),
+        };
+        let next = last
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("Mission counter is exhausted"))?;
+        self.0.write_atomic(&path, next.to_string().as_bytes())?;
+        Ok(next)
+    }
+
+    fn issue(&mut self, mission: &MissionHandle, name: Option<&str>) -> io::Result<()> {
+        let issued = serde_json::to_vec(&IssuedId {
+            mission_id: mission.mission_id.clone(),
+            handle: mission.handle.clone(),
+            entry: name.map(str::to_owned),
+        })
+        .map_err(io::Error::other)?;
+        if let Some(name) = name {
+            self.0
+                .write_atomic(&self.0.book_entry_path(name), &issued)?;
+        }
+        self.0
+            .write_atomic(&self.0.book_handle_path(&mission.handle), &issued)
+    }
+}
+
+impl FileRegistry {
+    /// Promotes a pending proposal while the caller holds the Registry lock.
+    pub(super) fn promote_locked(
+        &self,
+        operation: &str,
+        proposal_id: &str,
+        received_by: &str,
+    ) -> io::Result<Brief> {
+        let pending = self
+            .root
+            .join("proposals")
+            .join("pending")
+            .join(operation)
+            .join(format!("{proposal_id}.json"));
+        let approved = self
+            .root
+            .join("proposals")
+            .join("approved")
+            .join(operation)
+            .join(format!("{proposal_id}.json"));
+        if !pending.is_file() {
+            return match read_mission_proposal(&approved, self.limits.proposals.record_bytes) {
+                Ok(proposal) => {
+                    let mut brief = proposal.brief;
+                    if let Some(name) = MissionEntry::proposal(operation, proposal_id).book_name()
+                        && let Some(entered) = self.entered_id(&name)?
+                    {
+                        brief.mission_id = Some(entered.mission_id);
+                        brief.handle = Some(entered.handle);
+                    }
+                    self.attach_provenance(&mut brief);
+                    Ok(brief)
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    let rejected = self
+                        .root
+                        .join("proposals")
+                        .join("rejected")
+                        .join(operation)
+                        .join(format!("{proposal_id}.json"));
+                    if rejected.is_file() {
+                        Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "Mission proposal has already been rejected",
+                        ))
+                    } else {
+                        Err(error)
+                    }
+                }
+                Err(error) => Err(error),
+            };
+        }
+        let proposal = read_mission_proposal(&pending, self.limits.proposals.record_bytes)?;
+        if proposal.operation_id != operation || proposal.id != proposal_id {
+            return Err(invalid_data(
+                "Mission proposal path does not match its identity",
+            ));
+        }
+        let mut brief = proposal.brief.clone();
+        brief.enter_as(self.allot_locked(&MissionEntry::proposal(operation, proposal_id))?);
+        let key = brief.key();
+        for state in ["claimed", "done", "failed"] {
+            if self.root.join(state).join(format!("{key}.json")).exists() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "Mission proposal brief already exists in a terminal intake state",
+                ));
+            }
+        }
+        let queued = self.root.join("new").join(format!("{key}.json"));
+        if queued.is_file() {
+            let bytes = fs::read(&queued)?;
+            let existing: Brief =
+                serde_json::from_slice(&bytes).map_err(|error| invalid_data(error.to_string()))?;
+            brief.handle.clone_from(&existing.handle);
+            if existing.provenance.is_some() || existing != brief {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "Mission proposal brief conflicts with queued intake",
+                ));
+            }
+            self.attach_provenance(&mut brief);
+        } else {
+            brief.provenance = Some(proposal_provenance(&proposal, &brief, received_by));
+            self.write_brief(&queued, &brief)?;
+        }
+        let approved_parent = approved
+            .parent()
+            .ok_or_else(|| invalid_data("Mission proposal path has no parent"))?;
+        fs::create_dir_all(approved_parent)?;
+        fs::rename(&pending, &approved)?;
+        Ok(brief)
+    }
+}
+
+/// The state directories a brief can be in, furthest along first: a brief finished without a
+/// claim leaves its queued copy behind.
+const BRIEF_STATES: [&str; 5] = ["done", "failed", "claimed", "held", "new"];
+
+/// A brief as the Registry holds it, in whatever state it is.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub struct FiledBrief {
+    /// The brief.
+    pub brief: Brief,
+    /// `new`, `held`, `claimed`, `done` or `failed`.
+    pub state: String,
+    /// How many times it was claimed.
+    pub attempts: u32,
+    /// The outcome filed for it, once it finished.
+    pub outcome: Option<serde_json::Value>,
+}
+
+/// What [`BriefStore::reenter_brief`] did.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub enum Reentry {
+    /// Queued again as its Mission's next attempt; the brief as queued.
+    Queued(Brief),
+    /// The Mission's brief as filed, left as it was: queued, held or claimed, or finished and
+    /// not to be replaced.
+    Unchanged(FiledBrief),
+    /// The entry names no Mission, or its Mission has no brief.
+    Unknown,
+}
+
+/// The brief queue: Mission proposals, queued briefs, their leases and outcomes.
+pub trait BriefStore {
+    /// Stores an Agent-authored Mission proposal outside the scheduler's queue.
+    ///
+    /// Repeating an identical proposal is idempotent. Reusing its identity for different
+    /// content is rejected, and only an M-controlled authorization path may promote it.
+    fn submit_mission_proposal(&self, proposal: &MissionProposal) -> io::Result<()>;
+
+    /// Lists pending Mission proposals for one Operation in creation order.
+    fn list_mission_proposals(
+        &self,
+        operation: &str,
+        limit: usize,
+    ) -> io::Result<Vec<MissionProposal>>;
+
+    /// Authorizes one pending Mission proposal and promotes its brief to the runnable queue,
+    /// recording `received_by` (the Station or gateway that approved it) in the brief's
+    /// [`Provenance`]. Repeating an approval after a partial failure or successful promotion
+    /// is safe.
+    fn promote_mission_proposal(
+        &self,
+        operation: &str,
+        proposal_id: &str,
+        received_by: &str,
+    ) -> io::Result<Brief>;
+
+    /// Rejects one pending Mission proposal without exposing it to scheduler intake.
+    /// Repeating the rejection is safe; an approved proposal cannot be rejected.
+    fn reject_mission_proposal(
+        &self,
+        operation: &str,
+        proposal_id: &str,
+    ) -> io::Result<MissionProposal>;
+
+    /// Records what M's vetting found in a pending Mission proposal, replacing any earlier
+    /// result, and returns the proposal.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` when the proposal is not pending; `InvalidInput` for a bad identity.
+    fn set_proposal_vetting(
+        &self,
+        operation: &str,
+        proposal_id: &str,
+        vetting: &Vetting,
+    ) -> io::Result<MissionProposal>;
+
+    /// Reads valid queued briefs in priority, creation-time and key order.
+    /// Invalid records are skipped; nothing is claimed or moved.
+    fn list_new(&self) -> io::Result<Vec<Brief>>;
+
+    /// Queues one validated brief under the key it already has, keeping its [`Provenance`]
+    /// apart from the record. A brief submitted with none is treated like one dropped into the
+    /// queue. [`enter_brief`](Self::enter_brief) is how a brief gets its Mission ID.
+    ///
+    /// A key already present in any Registry state is never overwritten.
+    fn submit_brief(&self, brief: &Brief) -> io::Result<()>;
+
+    /// The Mission for `entry`: the one it already names, with its current handle, or a new UID
+    /// with a handle by the rule in [`mission_ids`], recorded for good. Numbers are atomic per
+    /// Operation across every process sharing the Registry and are never reused, including
+    /// when no brief follows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Registry cannot be read or written.
+    fn allot_mission_id(&self, entry: &MissionEntry) -> io::Result<MissionHandle>;
+
+    /// The UID of the Mission `entry` names, without giving one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Registry cannot be read.
+    fn entered_mission_id(&self, entry: &MissionEntry) -> io::Result<Option<String>>;
+
+    /// The Mission `id` names, with the handle it goes by now: `id` is its UID, the key of a
+    /// brief dropped by hand, or any handle it was ever given, compared without case. `None`
+    /// when nothing in the Registry goes by `id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Registry cannot be read.
+    fn resolve_mission(&self, id: &str) -> io::Result<Option<MissionHandle>>;
+
+    /// Renames the Mission whose UID is `mission_id` to `handle`, and returns it as renamed.
+    /// The old handle stays reserved and still names the Mission; nothing keyed by the UID
+    /// changes, nor what the brief says or its provenance.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` when no brief has that UID; `InvalidInput` for a malformed handle or a brief
+    /// with no handle (one dropped by hand); `AlreadyExists` when another Mission was ever given
+    /// `handle`; otherwise Registry I/O failures.
+    fn rename_mission(&self, mission_id: &str, handle: &str) -> io::Result<MissionHandle>;
+
+    /// Gives `brief` its Mission for `entry` and queues it, in one step, and returns it as
+    /// queued.
+    ///
+    /// # Errors
+    ///
+    /// `AlreadyExists` when the entry's brief is already in any Registry state; otherwise an
+    /// invalid brief or Registry I/O failures.
+    fn enter_brief(&self, brief: &Brief, entry: &MissionEntry) -> io::Result<Brief>;
+
+    /// Queues `brief` as the next attempt of the Mission `entry` already names, when that
+    /// Mission's brief finished and `again` accepts the brief as filed. The Mission keeps its UID
+    /// and its handle; the count of its claims starts again, so the `max_attempts` a
+    /// [`recover`](Self::recover) is given bounds the lapses of this attempt alone, and what the
+    /// last attempt filed (its outcome, its report and its spent provenance) is dropped. The
+    /// provenance is `brief`'s own.
+    ///
+    /// # Errors
+    ///
+    /// An invalid brief, or Registry I/O failures.
+    fn reenter_brief(
+        &self,
+        brief: &Brief,
+        entry: &MissionEntry,
+        again: &dyn Fn(&Brief) -> bool,
+    ) -> io::Result<Reentry>;
+
+    /// Atomically claims one queued brief, or the highest-priority queued brief. Concurrent
+    /// Stations never claim the same brief.
+    fn claim_new(&self, key: Option<&str>) -> io::Result<Option<Brief>>;
+
+    /// Claims the next matching brief and records a renewable lease.
+    ///
+    /// `key` selects one queued brief or uses Registry order when omitted. `station` identifies
+    /// the lease owner; `duration` must be positive. `meta` records assignment details for
+    /// other Registry users.
+    ///
+    /// Returns `None` when no matching brief remains queued.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid lease settings, Registry I/O failures or a corrupted
+    /// attempt count.
+    fn claim_with_lease(
+        &self,
+        key: Option<&str>,
+        station: &str,
+        duration: Duration,
+        meta: BTreeMap<String, serde_json::Value>,
+    ) -> io::Result<Option<Lease>>;
+
+    /// Reads a brief's lease, if the Registry has one.
+    ///
+    /// `key` must contain only the filesystem-safe characters used by [`Brief::key`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid key, unreadable lease record or Registry I/O failure.
+    fn lease(&self, key: &str) -> io::Result<Option<Lease>>;
+
+    /// Reads a currently claimed brief without changing its lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid key, unreadable file or invalid brief record.
+    fn read_claimed(&self, key: &str) -> io::Result<Option<Brief>>;
+
+    /// Returns leases for currently claimed briefs, ordered by brief key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Registry directory or a lease record cannot be read.
+    fn leases(&self) -> io::Result<Vec<Lease>>;
+
+    /// Extends a station's lease, returning `false` when it no longer owns a claimed brief.
+    ///
+    /// `duration` must be positive. Lease expiration uses wall-clock Unix time, so stations
+    /// sharing a Registry need synchronized clocks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid key or lease duration, or Registry I/O failure.
+    fn renew(&self, key: &str, station: &str, duration: Duration) -> io::Result<bool>;
+
+    /// Returns expired leases in stable key order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Registry directory or a lease record cannot be read.
+    fn expired(&self) -> io::Result<Vec<Lease>>;
+
+    /// Recovers an unchanged expired lease, requeueing it or filing a lost outcome.
+    ///
+    /// `max_attempts` is the maximum number of claims before the brief is failed. `by` is
+    /// recorded as the recovering station. A changed, renewed or unexpired lease returns `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Registry records cannot be read or written.
+    fn recover(
+        &self,
+        lease: &Lease,
+        max_attempts: u32,
+        by: &str,
+    ) -> io::Result<Option<LeaseRecovery>>;
+
+    /// Gives an unchanged expired lease to another Station, which carries on the same claim:
+    /// the brief stays claimed and the attempt count is unchanged. `meta` entries are added
+    /// to the lease's metadata.
+    ///
+    /// Returns the new lease, or `None` for a changed, renewed or unexpired lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid lease settings or Registry I/O failures.
+    fn hand_over(
+        &self,
+        lease: &Lease,
+        station: &str,
+        duration: Duration,
+        meta: BTreeMap<String, serde_json::Value>,
+    ) -> io::Result<Option<Lease>>;
+
+    /// Files an outcome for a brief, refusing to finish a claim held by another station.
+    ///
+    /// The outcome must be a JSON object. When `station` is provided, a missing or differently
+    /// owned lease returns `false`; otherwise the brief and outcome are filed as done or
+    /// failed, with an optional transcript, and `true` is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a non-object outcome or Registry I/O and serialization failures.
+    fn finish(
+        &self,
+        brief: &Brief,
+        outcome: &serde_json::Value,
+        ok: bool,
+        transcript: Option<&[u8]>,
+        station: Option<&str>,
+    ) -> io::Result<bool>;
+
+    /// The brief filed under `key`, in whatever state it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid key or Registry I/O failures.
+    fn filed_brief(&self, key: &str) -> io::Result<Option<FiledBrief>>;
+
+    /// The briefs of `operation`, newest first, at most `limit` of them. Every brief is read to
+    /// find them, up to `[registry.limits.briefs] records` per state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Registry cannot be read.
+    fn filed_briefs(&self, operation: &str, limit: usize) -> io::Result<Vec<FiledBrief>>;
+
+    /// Records that a cancel of the claimed brief `key` was asked for at `at`, as Unix seconds,
+    /// keeping the first time it was asked. `false` when the brief is not claimed. Finishing the
+    /// brief forgets it; a claim that lapses back to the queue keeps it.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` for an invalid key or time; Registry I/O failures otherwise.
+    fn request_cancel(&self, key: &str, at: f64) -> io::Result<bool>;
+
+    /// The claimed briefs a cancel was asked for, by key, with when it was first asked.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Registry cannot be read.
+    fn cancel_requests(&self) -> io::Result<BTreeMap<String, f64>>;
+}
+
+/// The Mission `brief` names and its handle, for a rename; a brief dropped by hand has none.
+pub(super) fn current_handle(brief: &Brief) -> io::Result<MissionHandle> {
+    match (&brief.mission_id, &brief.handle) {
+        (Some(mission_id), Some(handle)) => Ok(MissionHandle::new(mission_id, handle)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a brief dropped by hand has no handle to rename",
+        )),
+    }
+}
+
+/// The newest `limit` of `briefs`.
+pub(crate) fn newest_first(mut briefs: Vec<FiledBrief>, limit: usize) -> Vec<FiledBrief> {
+    briefs.sort_by(|left, right| {
+        right
+            .brief
+            .created
+            .cmp(&left.brief.created)
+            .then_with(|| right.brief.key().cmp(&left.brief.key()))
+    });
+    briefs.truncate(limit);
+    briefs
+}
+
+impl FileRegistry {
+    /// The attempts recorded for `key`.
+    fn attempts_of(&self, key: &str) -> u32 {
+        fs::read_to_string(self.root.join("attempts").join(format!("{key}.json")))
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// The brief in state directory `state` under `key`.
+    fn filed_in(&self, state: &str, key: &str) -> io::Result<Option<FiledBrief>> {
+        let path = self.root.join(state).join(format!("{key}.json"));
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if !self.limits.held_record_bytes().allows(bytes.len()) {
+            return Err(invalid_data("filed brief exceeds the size limit"));
+        }
+        let brief = if state == "held" {
+            serde_json::from_slice::<super::vetting::HeldBrief>(&bytes)
+                .map_err(|error| invalid_data(error.to_string()))?
+                .brief
+        } else {
+            serde_json::from_slice::<Brief>(&bytes)
+                .map_err(|error| invalid_data(error.to_string()))?
+        };
+        brief.validate()?;
+        let outcome = match fs::read(self.root.join(state).join(format!("{key}.outcome.json"))) {
+            Ok(bytes) => serde_json::from_slice(&bytes).ok(),
+            Err(_) => None,
+        };
+        Ok(Some(FiledBrief {
+            brief,
+            state: state.to_owned(),
+            attempts: self.attempts_of(key),
+            outcome,
+        }))
+    }
+}
+
+impl BriefStore for FileRegistry {
+    fn filed_brief(&self, key: &str) -> io::Result<Option<FiledBrief>> {
+        validate_registry_key(key)?;
+        for state in BRIEF_STATES {
+            if let Some(filed) = self.filed_in(state, key)? {
+                return Ok(Some(filed));
+            }
+        }
+        Ok(None)
+    }
+
+    fn filed_briefs(&self, operation: &str, limit: usize) -> io::Result<Vec<FiledBrief>> {
+        let mut found = Vec::new();
+        let mut seen = BTreeSet::new();
+        for state in BRIEF_STATES {
+            let entries = match fs::read_dir(self.root.join(state)) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            // A finished brief has an outcome, a provenance and a transcript beside it.
+            for entry in entries.take(self.limits.briefs.records.or_max().saturating_mul(4)) {
+                let name = entry?.file_name().to_string_lossy().into_owned();
+                let Some(key) = name.strip_suffix(".json") else {
+                    continue;
+                };
+                if key.ends_with(".outcome") || seen.contains(key) {
+                    continue;
+                }
+                // A record this cannot read is passed over, as a listing of the queue does.
+                if let Ok(Some(filed)) = self.filed_in(state, key)
+                    && filed.brief.operation.as_deref() == Some(operation)
+                {
+                    seen.insert(key.to_owned());
+                    found.push(filed);
+                }
+            }
+        }
+        Ok(newest_first(found, limit))
+    }
+
+    fn submit_mission_proposal(&self, proposal: &MissionProposal) -> io::Result<()> {
+        proposal.validate()?;
+        let _registry_lock = self.lock()?;
+        let directory = self
+            .root
+            .join("proposals")
+            .join("pending")
+            .join(&proposal.operation_id);
+        fs::create_dir_all(&directory)?;
+        let path = directory.join(format!("{}.json", proposal.id));
+        let mut stored = proposal.clone();
+        stored.vetting = None;
+        if path.exists() {
+            let existing = read_mission_proposal(&path, self.limits.proposals.record_bytes)?;
+            stored.created_at = existing.created_at;
+            stored.vetting.clone_from(&existing.vetting);
+            if existing == stored {
+                return Ok(());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Mission proposal identity already has different content",
+            ));
+        }
+        let mut count = 0;
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+            {
+                count += 1;
+            }
+        }
+        if !self.limits.proposals.records.allows(count + 1) {
+            return Err(invalid_data(format!(
+                "Operation has reached the {} pending Mission proposal limit",
+                self.limits.proposals.records
+            )));
+        }
+        stored.created_at = unix_time()?;
+        let bytes = serde_json::to_vec_pretty(&stored).map_err(io::Error::other)?;
+        if !self.limits.proposals.record_bytes.allows(bytes.len()) {
+            return Err(invalid_data("Mission proposal exceeds the size limit"));
+        }
+        self.write_atomic(&path, &bytes)?;
+        Ok(())
+    }
+
+    fn list_mission_proposals(
+        &self,
+        operation: &str,
+        limit: usize,
+    ) -> io::Result<Vec<MissionProposal>> {
+        validate_registry_key(operation)?;
+        if limit == 0 || !self.limits.proposals.results.allows(limit) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Mission proposal result limit must be between 1 and {}",
+                    self.limits.proposals.results
+                ),
+            ));
+        }
+        let directory = self.root.join("proposals").join("pending").join(operation);
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut paths = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+            {
+                if !self.limits.proposals.records.allows(paths.len() + 1) {
+                    return Err(invalid_data(format!(
+                        "Operation has more than {} Mission proposals",
+                        self.limits.proposals.records
+                    )));
+                }
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        let mut proposals = Vec::new();
+        for path in paths {
+            match read_mission_proposal(&path, self.limits.proposals.record_bytes) {
+                Ok(proposal)
+                    if proposal.operation_id == operation
+                        && path.file_stem().and_then(|stem| stem.to_str())
+                            == Some(proposal.id.as_str()) =>
+                {
+                    proposals.push(proposal)
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => {}
+                Err(error) => return Err(error),
+            }
+        }
+        proposals.sort_by(|left, right| {
+            left.created_at
+                .total_cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        proposals.truncate(limit);
+        Ok(proposals)
+    }
+
+    fn promote_mission_proposal(
+        &self,
+        operation: &str,
+        proposal_id: &str,
+        received_by: &str,
+    ) -> io::Result<Brief> {
+        validate_registry_key(operation)?;
+        validate_registry_key(proposal_id)?;
+        let _registry_lock = self.lock()?;
+        self.promote_locked(operation, proposal_id, received_by)
+    }
+
+    fn reject_mission_proposal(
+        &self,
+        operation: &str,
+        proposal_id: &str,
+    ) -> io::Result<MissionProposal> {
+        validate_registry_key(operation)?;
+        validate_registry_key(proposal_id)?;
+        let _registry_lock = self.lock()?;
+        let pending = self
+            .root
+            .join("proposals")
+            .join("pending")
+            .join(operation)
+            .join(format!("{proposal_id}.json"));
+        let rejected = self
+            .root
+            .join("proposals")
+            .join("rejected")
+            .join(operation)
+            .join(format!("{proposal_id}.json"));
+        if !pending.is_file() {
+            if let Ok(proposal) =
+                read_mission_proposal(&rejected, self.limits.proposals.record_bytes)
+            {
+                return Ok(proposal);
+            }
+            let approved = self
+                .root
+                .join("proposals")
+                .join("approved")
+                .join(operation)
+                .join(format!("{proposal_id}.json"));
+            if approved.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "Mission proposal has already been approved",
+                ));
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Mission proposal does not exist",
+            ));
+        }
+        let proposal = read_mission_proposal(&pending, self.limits.proposals.record_bytes)?;
+        if proposal.operation_id != operation || proposal.id != proposal_id {
+            return Err(invalid_data(
+                "Mission proposal path does not match its identity",
+            ));
+        }
+        let rejected_parent = rejected
+            .parent()
+            .ok_or_else(|| invalid_data("Mission proposal path has no parent"))?;
+        fs::create_dir_all(rejected_parent)?;
+        fs::rename(&pending, &rejected)?;
+        Ok(proposal)
+    }
+
+    fn set_proposal_vetting(
+        &self,
+        operation: &str,
+        proposal_id: &str,
+        vetting: &Vetting,
+    ) -> io::Result<MissionProposal> {
+        validate_registry_key(operation)?;
+        validate_registry_key(proposal_id)?;
+        let _registry_lock = self.lock()?;
+        let pending = self
+            .root
+            .join("proposals")
+            .join("pending")
+            .join(operation)
+            .join(format!("{proposal_id}.json"));
+        let mut proposal = match read_mission_proposal(&pending, self.limits.proposals.record_bytes)
+        {
+            Ok(proposal) if proposal.operation_id == operation && proposal.id == proposal_id => {
+                proposal
+            }
+            Ok(_) => {
+                return Err(invalid_data(
+                    "Mission proposal path does not match its identity",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Mission proposal is not pending",
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        proposal.vetting = Some(vetting.clone());
+        let bytes = serde_json::to_vec_pretty(&proposal).map_err(io::Error::other)?;
+        if !self.limits.proposals.record_bytes.allows(bytes.len()) {
+            return Err(invalid_data("Mission proposal exceeds the size limit"));
+        }
+        self.write_atomic(&pending, &bytes)?;
+        Ok(proposal)
+    }
+
+    fn list_new(&self) -> io::Result<Vec<Brief>> {
+        let directory = self.root.join("new");
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut paths = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            if !self.limits.briefs.records.allows(paths.len() + 1) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Registry has more than {} queued briefs",
+                        self.limits.briefs.records
+                    ),
+                ));
+            }
+            let path = entry.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+                && entry.file_type()?.is_file()
+            {
+                paths.push(path);
+            }
+        }
+        paths.sort();
+
+        let mut briefs = Vec::new();
+        for path in paths {
+            let Ok(metadata) = fs::metadata(&path) else {
+                continue;
+            };
+            if !self.limits.briefs.record_bytes.allows(metadata.len()) {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            let Ok(mut brief) = serde_json::from_slice::<Brief>(&bytes) else {
+                continue;
+            };
+            if brief.validate().is_ok() {
+                self.attach_provenance(&mut brief);
+                briefs.push(brief);
+            }
+        }
+        briefs.sort_by(|left, right| {
+            right
+                .priority
+                .cmp(&left.priority)
+                .then_with(|| left.created.cmp(&right.created))
+                .then_with(|| left.key().cmp(&right.key()))
+        });
+        Ok(briefs)
+    }
+
+    fn submit_brief(&self, brief: &Brief) -> io::Result<()> {
+        brief.validate()?;
+        let key = brief.key();
+        let _registry_lock = self.lock()?;
+        for state in ["new", "held", "claimed", "done", "failed"] {
+            if self.root.join(state).join(format!("{key}.json")).exists() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("brief {key} already exists in {state}"),
+                ));
+            }
+        }
+        self.write_brief(&self.root.join("new").join(format!("{key}.json")), brief)
+    }
+
+    fn allot_mission_id(&self, entry: &MissionEntry) -> io::Result<MissionHandle> {
+        let _registry_lock = self.lock()?;
+        self.allot_locked(entry)
+    }
+
+    fn entered_mission_id(&self, entry: &MissionEntry) -> io::Result<Option<String>> {
+        match entry.book_name() {
+            Some(name) => Ok(self.entered_id(&name)?.map(|entered| entered.mission_id)),
+            None => Ok(None),
+        }
+    }
+
+    fn resolve_mission(&self, id: &str) -> io::Result<Option<MissionHandle>> {
+        if validate_registry_key(id).is_err() {
+            return Ok(None);
+        }
+        // A handle first: a brief dropped by hand may go by a key that reads as one.
+        if let Some(issued) = self.issued_handle(id)? {
+            return Ok(Some(match self.filed_brief(&issued.mission_id)? {
+                Some(filed) => filed.brief.mission_handle(),
+                None => MissionHandle::new(issued.mission_id, issued.handle),
+            }));
+        }
+        Ok(self
+            .filed_brief(id)?
+            .map(|filed| filed.brief.mission_handle()))
+    }
+
+    fn rename_mission(&self, mission_id: &str, handle: &str) -> io::Result<MissionHandle> {
+        validate_registry_key(mission_id)?;
+        let _registry_lock = self.lock()?;
+        let filed = self
+            .filed_brief(mission_id)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no Mission has this UID"))?;
+        let current = current_handle(&filed.brief)?;
+        let renamed =
+            mission_ids::rename(&mut FileBook(self), &current, handle, &self.limits.briefs)?;
+        self.rehandle_locked(mission_id, &renamed.handle)?;
+        Ok(renamed)
+    }
+
+    fn enter_brief(&self, brief: &Brief, entry: &MissionEntry) -> io::Result<Brief> {
+        brief.validate()?;
+        let mut entered = brief.clone();
+        let _registry_lock = self.lock()?;
+        entered.enter_as(self.allot_locked(entry)?);
+        let key = entered.key();
+        for state in ["new", "held", "claimed", "done", "failed"] {
+            if self.root.join(state).join(format!("{key}.json")).exists() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("brief {key} already exists in {state}"),
+                ));
+            }
+        }
+        self.write_brief(&self.root.join("new").join(format!("{key}.json")), &entered)?;
+        Ok(entered)
+    }
+
+    fn reenter_brief(
+        &self,
+        brief: &Brief,
+        entry: &MissionEntry,
+        again: &dyn Fn(&Brief) -> bool,
+    ) -> io::Result<Reentry> {
+        brief.validate()?;
+        let Some(name) = entry.book_name() else {
+            return Ok(Reentry::Unknown);
+        };
+        let _registry_lock = self.lock()?;
+        let Some(mission) = self.entered_id(&name)? else {
+            return Ok(Reentry::Unknown);
+        };
+        let mut entered = brief.clone();
+        entered.enter_as(mission);
+        let key = entered.key();
+        let Some(filed) = self.filed_brief(&key)? else {
+            return Ok(Reentry::Unknown);
+        };
+        if !matches!(filed.state.as_str(), "done" | "failed") || !again(&filed.brief) {
+            return Ok(Reentry::Unchanged(filed));
+        }
+        // Queued first: a crash before the old record goes leaves it finished and queued, as a
+        // brief finished without a claim is, never neither.
+        self.write_brief(&self.root.join("new").join(format!("{key}.json")), &entered)?;
+        match fs::remove_file(self.root.join("attempts").join(format!("{key}.json"))) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let finished = self.root.join(&filed.state);
+        for suffix in ["outcome.json", "reported", "provenance", "log", "json"] {
+            match fs::remove_file(finished.join(format!("{key}.{suffix}"))) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(Reentry::Queued(entered))
+    }
+
+    fn claim_new(&self, key: Option<&str>) -> io::Result<Option<Brief>> {
+        let _registry_lock = self.lock()?;
+        let destination_dir = self.root.join("claimed");
+        fs::create_dir_all(&destination_dir)?;
+        for brief in self.list_new()? {
+            if key.is_some_and(|key| brief.key() != key) {
+                continue;
+            }
+            let source = self.root.join("new").join(format!("{}.json", brief.key()));
+            let destination = destination_dir.join(format!("{}.json", brief.key()));
+            if destination.exists() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("brief {} already exists in claimed/", brief.key()),
+                ));
+            }
+            match fs::rename(source, destination) {
+                Ok(()) => return Ok(Some(brief)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
+    }
+
+    fn claim_with_lease(
+        &self,
+        key: Option<&str>,
+        station: &str,
+        duration: Duration,
+        meta: BTreeMap<String, serde_json::Value>,
+    ) -> io::Result<Option<Lease>> {
+        if station.trim().is_empty() || duration.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a Registry lease needs a station and positive duration",
+            ));
+        }
+        let _registry_lock = self.lock()?;
+        let destination_dir = self.root.join("claimed");
+        fs::create_dir_all(&destination_dir)?;
+        for brief in self.list_new()? {
+            if key.is_some_and(|key| brief.key() != key) {
+                continue;
+            }
+            let key = brief.key();
+            let source = self.root.join("new").join(format!("{key}.json"));
+            let destination = destination_dir.join(format!("{key}.json"));
+            let attempts_path = self.root.join("attempts").join(format!("{key}.json"));
+            let previous_attempt = match fs::read_to_string(&attempts_path) {
+                Ok(value) => value
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| invalid_data("invalid Registry attempt count"))?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+                Err(error) => return Err(error),
+            };
+            let attempt = previous_attempt
+                .checked_add(1)
+                .ok_or_else(|| invalid_data("Registry attempt count is exhausted"))?;
+            let expires = unix_time()? + duration.as_secs_f64();
+            if destination.exists() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("brief {key} already exists in claimed/"),
+                ));
+            }
+            match fs::rename(source, destination) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            }
+
+            let lease = Lease {
+                key: key.clone(),
+                station: station.to_owned(),
+                expires,
+                attempt,
+                meta,
+            };
+            let record = LeaseRecord::from_lease(&lease);
+            let attempts_result = self.write_atomic(&attempts_path, attempt.to_string().as_bytes());
+            let lease_result = serde_json::to_vec(&record)
+                .map_err(io::Error::other)
+                .and_then(|bytes| {
+                    self.write_atomic(
+                        &self.root.join("leases").join(format!("{key}.json")),
+                        &bytes,
+                    )
+                });
+            if let Err(error) = attempts_result.and(lease_result) {
+                let _ = fs::rename(
+                    self.root.join("claimed").join(format!("{key}.json")),
+                    self.root.join("new").join(format!("{key}.json")),
+                );
+                return Err(error);
+            }
+            return Ok(Some(lease));
+        }
+        Ok(None)
+    }
+
+    fn lease(&self, key: &str) -> io::Result<Option<Lease>> {
+        validate_registry_key(key)?;
+        let path = self.root.join("leases").join(format!("{key}.json"));
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let record = serde_json::from_slice::<LeaseRecord>(&bytes).map_err(io::Error::other)?;
+        record.into_lease(key.to_owned()).map(Some)
+    }
+
+    fn read_claimed(&self, key: &str) -> io::Result<Option<Brief>> {
+        validate_registry_key(key)?;
+        let path = self.root.join("claimed").join(format!("{key}.json"));
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if !self.limits.briefs.record_bytes.allows(bytes.len()) {
+            return Err(invalid_data("claimed brief exceeds the size limit"));
+        }
+        let mut brief = serde_json::from_slice::<Brief>(&bytes).map_err(io::Error::other)?;
+        brief.validate()?;
+        self.attach_provenance(&mut brief);
+        Ok(Some(brief))
+    }
+
+    fn leases(&self) -> io::Result<Vec<Lease>> {
+        let directory = self.root.join("claimed");
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut leases = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_file()
+                || entry
+                    .path()
+                    .extension()
+                    .is_none_or(|extension| extension != "json")
+            {
+                continue;
+            }
+            if let Some(lease) = self.lease(
+                &entry
+                    .path()
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy(),
+            )? {
+                leases.push(lease);
+            }
+        }
+        leases.sort_by(|left, right| left.key.cmp(&right.key));
+        Ok(leases)
+    }
+
+    fn renew(&self, key: &str, station: &str, duration: Duration) -> io::Result<bool> {
+        validate_registry_key(key)?;
+        if station.trim().is_empty() || duration.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a Registry lease needs a station and positive duration",
+            ));
+        }
+        let _registry_lock = self.lock()?;
+        let Some(mut lease) = self.lease(key)? else {
+            return Ok(false);
+        };
+        if lease.station != station
+            || !self
+                .root
+                .join("claimed")
+                .join(format!("{key}.json"))
+                .is_file()
+        {
+            return Ok(false);
+        }
+        lease.expires = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_secs_f64()
+            + duration.as_secs_f64();
+        let bytes =
+            serde_json::to_vec(&LeaseRecord::from_lease(&lease)).map_err(io::Error::other)?;
+        self.write_atomic(
+            &self.root.join("leases").join(format!("{key}.json")),
+            &bytes,
+        )?;
+        Ok(true)
+    }
+
+    fn expired(&self) -> io::Result<Vec<Lease>> {
+        let now = unix_time()?;
+        Ok(self
+            .leases()?
+            .into_iter()
+            .filter(|lease| lease.expires < now)
+            .collect())
+    }
+
+    fn recover(
+        &self,
+        lease: &Lease,
+        max_attempts: u32,
+        by: &str,
+    ) -> io::Result<Option<LeaseRecovery>> {
+        validate_registry_key(lease.key())?;
+        let _registry_lock = self.lock()?;
+        if self.lease(lease.key())?.as_ref() != Some(lease) || lease.expires >= unix_time()? {
+            return Ok(None);
+        }
+        let source = self
+            .root
+            .join("claimed")
+            .join(format!("{}.json", lease.key()));
+        if lease.attempt() < max_attempts {
+            match fs::rename(
+                &source,
+                self.root.join("new").join(format!("{}.json", lease.key())),
+            ) {
+                Ok(()) => {
+                    remove_lease(&self.root, lease.key())?;
+                    return Ok(Some(LeaseRecovery::Requeued));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        }
+        let bytes = match fs::read(&source) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let brief = match serde_json::from_slice::<Brief>(&bytes) {
+            Ok(brief) if brief.validate().is_ok() => brief,
+            _ => return Ok(None),
+        };
+        finish_locked(self, &brief, &lost_outcome(lease, by), false, None)?;
+        Ok(Some(LeaseRecovery::Failed))
+    }
+
+    fn hand_over(
+        &self,
+        lease: &Lease,
+        station: &str,
+        duration: Duration,
+        meta: BTreeMap<String, serde_json::Value>,
+    ) -> io::Result<Option<Lease>> {
+        validate_registry_key(lease.key())?;
+        if station.trim().is_empty() || duration.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a Registry lease needs a station and positive duration",
+            ));
+        }
+        let _registry_lock = self.lock()?;
+        let now = unix_time()?;
+        if self.lease(lease.key())?.as_ref() != Some(lease)
+            || lease.expires >= now
+            || !self
+                .root
+                .join("claimed")
+                .join(format!("{}.json", lease.key()))
+                .is_file()
+        {
+            return Ok(None);
+        }
+        let mut handed = lease.clone();
+        handed.station = station.to_owned();
+        handed.expires = now + duration.as_secs_f64();
+        handed.meta.extend(meta);
+        let bytes =
+            serde_json::to_vec(&LeaseRecord::from_lease(&handed)).map_err(io::Error::other)?;
+        self.write_atomic(
+            &self
+                .root
+                .join("leases")
+                .join(format!("{}.json", lease.key())),
+            &bytes,
+        )?;
+        Ok(Some(handed))
+    }
+
+    fn finish(
+        &self,
+        brief: &Brief,
+        outcome: &serde_json::Value,
+        ok: bool,
+        transcript: Option<&[u8]>,
+        station: Option<&str>,
+    ) -> io::Result<bool> {
+        if !outcome.is_object() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Registry outcomes must be JSON objects",
+            ));
+        }
+        let _registry_lock = self.lock()?;
+        if let Some(station) = station {
+            let key = brief.key();
+            let lease = self.lease(&key)?;
+            let claimed = self
+                .root
+                .join("claimed")
+                .join(format!("{key}.json"))
+                .is_file();
+            if lease
+                .as_ref()
+                .is_none_or(|lease| lease.station() != station)
+                || !claimed
+            {
+                return Ok(false);
+            }
+        }
+        finish_locked(self, brief, outcome, ok, transcript)?;
+        Ok(true)
+    }
+
+    fn request_cancel(&self, key: &str, at: f64) -> io::Result<bool> {
+        validate_registry_key(key)?;
+        if !at.is_finite() || at < 0.0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a cancel time must be Unix seconds",
+            ));
+        }
+        let _registry_lock = self.lock()?;
+        if !self
+            .root
+            .join("claimed")
+            .join(format!("{key}.json"))
+            .is_file()
+        {
+            return Ok(false);
+        }
+        let path = cancel_path(&self.root, key);
+        if read_cancel(&path)?.is_none() {
+            self.write_atomic(&path, at.to_string().as_bytes())?;
+        }
+        Ok(true)
+    }
+
+    fn cancel_requests(&self) -> io::Result<BTreeMap<String, f64>> {
+        let entries = match fs::read_dir(self.root.join("cancels")) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+            Err(error) => return Err(error),
+        };
+        let mut requests = BTreeMap::new();
+        for entry in entries {
+            let path = entry?.path();
+            let Some(key) = path.file_stem().and_then(|stem| stem.to_str()).filter(|_| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            }) else {
+                continue;
+            };
+            if !self
+                .root
+                .join("claimed")
+                .join(format!("{key}.json"))
+                .is_file()
+            {
+                continue;
+            }
+            if let Some(at) = read_cancel(&path)? {
+                requests.insert(key.to_owned(), at);
+            }
+        }
+        Ok(requests)
+    }
+}
+
+/// Where a claimed brief's cancel request is kept.
+fn cancel_path(root: &Path, key: &str) -> PathBuf {
+    root.join("cancels").join(format!("{key}.json"))
+}
+
+/// When a cancel was asked for, or `None` when it was not or the record does not read as a time.
+fn read_cancel(path: &Path) -> io::Result<Option<f64>> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(text.trim().parse::<f64>().ok().filter(|at| at.is_finite())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Station check-ins and settings, and the Headquarters lease.
+pub trait StationStore {
+    /// Records this station's metadata and current check-in time in the shared Registry.
+    ///
+    /// Reserved `station` and `seen` keys in `info` are replaced with the supplied identity
+    /// and current Unix time. Station IDs are bounded to 256 UTF-8 bytes and may not contain
+    /// control characters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the station ID is invalid, the record exceeds 1 MiB, or the
+    /// Registry cannot be locked or written.
+    fn check_in(&self, station: &str, info: BTreeMap<String, serde_json::Value>) -> io::Result<()>;
+
+    /// Returns check-ins no older than `within`, in stable station-file order.
+    ///
+    /// Malformed, oversized and stale records are skipped.
+    fn stations(&self, within: Duration) -> io::Result<Vec<StationRecord>>;
+
+    /// Returns validated live settings for one Station, when configured.
+    fn station_settings(&self, station: &str) -> io::Result<Option<StationSettings>>;
+
+    /// Persists validated live settings for one Station in the shared Registry.
+    fn set_station_settings(&self, station: &str, settings: &StationSettings) -> io::Result<()>;
+
+    /// Holds, renews or takes the shared Headquarters lease for `station`.
+    ///
+    /// At most one station wins an expired lease because the shared Registry lock covers the
+    /// read, expiry move and replacement. `ttl` must be positive. This uses the same
+    /// `headquarters/lease.json` record shared by all AI6 Stations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid station ID or TTL, malformed Registry state, or an
+    /// underlying filesystem or locking failure.
+    fn elect(&self, station: &str, ttl: Duration) -> io::Result<bool>;
+
+    /// Reads the Headquarters lease, whether live or expired.
+    fn headquarters(&self) -> io::Result<Option<HeadquartersLease>>;
+}
+
+impl StationStore for FileRegistry {
+    fn check_in(&self, station: &str, info: BTreeMap<String, serde_json::Value>) -> io::Result<()> {
+        let bytes = check_in_record(station, info, unix_time()?, &self.limits.stations)?;
+        let _registry_lock = self.lock()?;
+        let path = self
+            .root
+            .join("stations")
+            .join(format!("{}.json", registry_station_component(station)));
+        self.write_atomic(&path, &bytes)
+    }
+
+    fn stations(&self, within: Duration) -> io::Result<Vec<StationRecord>> {
+        let directory = self.root.join("stations");
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut paths = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+            {
+                if !self.limits.stations.records.allows(paths.len() + 1) {
+                    return Err(invalid_data(format!(
+                        "Registry has more than {} station records",
+                        self.limits.stations.records
+                    )));
+                }
+                paths.push(path);
+            }
+        }
+        paths.sort();
+
+        let now = unix_time()?;
+        let window = within.as_secs_f64();
+        let mut stations = Vec::with_capacity(paths.len());
+        for path in paths {
+            let Ok(metadata) = fs::metadata(&path) else {
+                continue;
+            };
+            if !self.limits.stations.record_bytes.allows(metadata.len()) {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            let Ok(file) = serde_json::from_slice::<StationRecordFile>(&bytes) else {
+                continue;
+            };
+            let Ok(record) = file.into_station_record() else {
+                continue;
+            };
+            if now - record.seen <= window {
+                stations.push(record);
+            }
+        }
+        Ok(stations)
+    }
+
+    fn station_settings(&self, station: &str) -> io::Result<Option<StationSettings>> {
+        validate_station_id(station)?;
+        let path = self.station_settings_path(station);
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if !self.limits.stations.settings_bytes.allows(bytes.len()) {
+            return Err(invalid_data("Station settings exceed the size limit"));
+        }
+        let record: StationSettingsFile = serde_json::from_slice(&bytes)
+            .map_err(|_| invalid_data("Station settings are invalid"))?;
+        if record.station != station {
+            return Err(invalid_data("Station settings identity does not match"));
+        }
+        let limits = ResourceLimits::new(record.min_free_memory_mb, record.max_cpu_percent);
+        StationSettings::try_new(record.station, record.max_concurrent_missions)
+            .and_then(|settings| settings.with_resource_limits(limits))
+            .map(Some)
+            .map_err(|_| invalid_data("Station settings are invalid"))
+    }
+
+    fn set_station_settings(&self, station: &str, settings: &StationSettings) -> io::Result<()> {
+        check_settings(station, settings, &self.limits.stations)?;
+        let record = StationSettingsFile {
+            station: settings.station.clone(),
+            max_concurrent_missions: settings.max_concurrent_missions,
+            min_free_memory_mb: settings.resource_limits.min_free_memory_mb,
+            max_cpu_percent: settings.resource_limits.max_cpu_percent,
+        };
+        let bytes = serde_json::to_vec(&record).map_err(io::Error::other)?;
+        if !self.limits.stations.settings_bytes.allows(bytes.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Station settings exceed the size limit",
+            ));
+        }
+        let _registry_lock = self.lock()?;
+        let path = self.station_settings_path(station);
+        self.write_atomic(&path, &bytes)
+    }
+
+    fn elect(&self, station: &str, ttl: Duration) -> io::Result<bool> {
+        check_election(station, ttl)?;
+        let _registry_lock = self.lock()?;
+        let directory = self.root.join("headquarters");
+        fs::create_dir_all(&directory)?;
+        let path = directory.join("lease.json");
+        let current = read_headquarters(&path, self.limits.stations.record_bytes)?;
+        let Some(elected) = elected(current.as_ref(), station, ttl, unix_time()?) else {
+            return Ok(false);
+        };
+        if current
+            .as_ref()
+            .is_some_and(|lease| lease.station != station)
+        {
+            let lapsed = directory.join(format!(
+                "lease.lapsed.{}",
+                registry_station_component(station)
+            ));
+            match fs::rename(&path, lapsed) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            }
+        }
+        write_headquarters(self, &path, &elected)?;
+        Ok(true)
+    }
+
+    fn headquarters(&self) -> io::Result<Option<HeadquartersLease>> {
+        let _registry_lock = self.lock()?;
+        read_headquarters(
+            &self.root.join("headquarters").join("lease.json"),
+            self.limits.stations.record_bytes,
+        )
+    }
+}
+
+/// Universal Exports user access tokens, stored by digest.
+pub trait AccessTokenStore {
+    /// Stores revocable access-token metadata under the shared Registry.
+    ///
+    /// Only the SHA-256 digest is retained; the bearer secret is returned to its issuer
+    /// once and is never written to the Registry. Token IDs and digests are unique.
+    fn store_access_token(&self, record: &crate::AccessTokenRecord) -> io::Result<()>;
+
+    /// Returns an active bearer token's record by its lowercase SHA-256 digest: never a session
+    /// cookie's, and nothing for a token whose sign-in was revoked.
+    fn find_access_token(&self, digest: &str) -> io::Result<Option<crate::AccessTokenRecord>>;
+
+    /// Returns an active session cookie's record by its lowercase SHA-256 digest; a bearer
+    /// token's digest finds nothing.
+    fn find_session_cookie(&self, digest: &str) -> io::Result<Option<crate::AccessTokenRecord>>;
+
+    /// Returns the record of a sign-in that stands, by its public UUID: an active session
+    /// cookie, or an active bearer token whose sign-in, when it has one, stands too.
+    fn login_by_id(&self, token_id: &str) -> io::Result<Option<crate::AccessTokenRecord>>;
+
+    /// Revokes a token or session cookie by its public UUID, returning false when unknown or
+    /// already revoked. A token of a sign-in takes that sign-in with it, and so every other
+    /// token of it, including one issued a moment later.
+    fn revoke_access_token(&self, token_id: &str) -> io::Result<bool>;
+
+    /// Moves an active token's expiry to `expires_at` (Unix seconds) when that is later, and
+    /// answers the record as it now stands; a time no later leaves it as it was. Its value,
+    /// issue time and revocation never change. `None` when unknown, revoked or expired, and
+    /// for a session cookie, whose end stays where signing in put it.
+    fn extend_access_token(
+        &self,
+        token_id: &str,
+        expires_at: f64,
+    ) -> io::Result<Option<crate::AccessTokenRecord>>;
+}
+
+impl AccessTokenStore for FileRegistry {
+    fn store_access_token(&self, record: &crate::AccessTokenRecord) -> io::Result<()> {
+        let record = validate_access_token_record(record)?;
+        let token_path = self
+            .root
+            .join("access-tokens")
+            .join(format!("{}.json", record.token_id()));
+        let digest_path = self
+            .root
+            .join("access-token-digests")
+            .join(format!("{}.txt", record.digest()));
+        let _registry_lock = self.lock()?;
+        if token_path.exists() || digest_path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "access token ID or digest already exists",
+            ));
+        }
+        let bytes = serde_json::to_vec(&record).map_err(io::Error::other)?;
+        if !self.limits.tokens.record_bytes.allows(bytes.len()) {
+            return Err(invalid_data("access token record exceeds the size limit"));
+        }
+        self.write_atomic(&token_path, &bytes)?;
+        self.write_atomic(&digest_path, record.token_id().as_bytes())
+    }
+
+    fn find_access_token(&self, digest: &str) -> io::Result<Option<crate::AccessTokenRecord>> {
+        validate_token_digest(digest)?;
+        let _registry_lock = self.lock()?;
+        let Some(record) = self.token_by_digest(digest)? else {
+            return Ok(None);
+        };
+        if record.is_session_cookie() || !record.active_at(unix_time()?) {
+            return Ok(None);
+        }
+        let sign_in = match record.sign_in() {
+            Some(sign_in) => self.stored_access_token(&self.access_token_path(sign_in), sign_in)?,
+            None => None,
+        };
+        Ok(sign_in_stands(&record, sign_in.as_ref()).then_some(record))
+    }
+
+    fn find_session_cookie(&self, digest: &str) -> io::Result<Option<crate::AccessTokenRecord>> {
+        validate_token_digest(digest)?;
+        let _registry_lock = self.lock()?;
+        let Some(record) = self.token_by_digest(digest)? else {
+            return Ok(None);
+        };
+        Ok((record.is_session_cookie() && record.active_at(unix_time()?)).then_some(record))
+    }
+
+    fn login_by_id(&self, token_id: &str) -> io::Result<Option<crate::AccessTokenRecord>> {
+        validate_token_id(token_id)?;
+        let _registry_lock = self.lock()?;
+        let Some(record) = self.stored_access_token(&self.access_token_path(token_id), token_id)?
+        else {
+            return Ok(None);
+        };
+        if !record.active_at(unix_time()?) {
+            return Ok(None);
+        }
+        let sign_in = match record.sign_in() {
+            Some(sign_in) => self.stored_access_token(&self.access_token_path(sign_in), sign_in)?,
+            None => None,
+        };
+        Ok(sign_in_stands(&record, sign_in.as_ref()).then_some(record))
+    }
+
+    fn revoke_access_token(&self, token_id: &str) -> io::Result<bool> {
+        validate_token_id(token_id)?;
+        let token_path = self.access_token_path(token_id);
+        let _registry_lock = self.lock()?;
+        let Some(record) = self.stored_access_token(&token_path, token_id)? else {
+            return Ok(false);
+        };
+        if record.revoked_at().is_some() {
+            return Ok(false);
+        }
+        let now = unix_time()?;
+        if let Some(sign_in) = record.sign_in() {
+            let path = self.access_token_path(sign_in);
+            let cookie = self.stored_access_token(&path, sign_in)?;
+            if let Some(cookie) = cookie.filter(|cookie| cookie.revoked_at().is_none()) {
+                let cookie = revoked_token(&cookie, now)?;
+                let bytes = serde_json::to_vec(&cookie).map_err(io::Error::other)?;
+                self.write_atomic(&path, &bytes)?;
+            }
+        }
+        let updated = revoked_token(&record, now)?;
+        let updated = serde_json::to_vec(&updated).map_err(io::Error::other)?;
+        self.write_atomic(&token_path, &updated)?;
+        Ok(true)
+    }
+
+    fn extend_access_token(
+        &self,
+        token_id: &str,
+        expires_at: f64,
+    ) -> io::Result<Option<crate::AccessTokenRecord>> {
+        validate_token_id(token_id)?;
+        let token_path = self.access_token_path(token_id);
+        let _registry_lock = self.lock()?;
+        let Some(record) = self.stored_access_token(&token_path, token_id)? else {
+            return Ok(None);
+        };
+        let Some(extended) = extended_token(&record, expires_at, unix_time()?)? else {
+            return Ok(None);
+        };
+        if extended.expires_at() > record.expires_at() {
+            let bytes = serde_json::to_vec(&extended).map_err(io::Error::other)?;
+            self.write_atomic(&token_path, &bytes)?;
+        }
+        Ok(Some(extended))
+    }
+}
+
+impl FileRegistry {
+    /// The valid record stored under `digest`, active or not, under the caller's Registry lock.
+    fn token_by_digest(&self, digest: &str) -> io::Result<Option<crate::AccessTokenRecord>> {
+        let digest_path = self
+            .root
+            .join("access-token-digests")
+            .join(format!("{digest}.txt"));
+        let token_id = match fs::read_to_string(digest_path) {
+            Ok(token_id) => token_id.trim().to_owned(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let token_path = self
+            .root
+            .join("access-tokens")
+            .join(format!("{}.json", registry_station_component(&token_id)));
+        Ok(self
+            .stored_access_token(&token_path, &token_id)?
+            .filter(|record| record.digest() == digest))
+    }
+
+    fn access_token_path(&self, token_id: &str) -> PathBuf {
+        self.root
+            .join("access-tokens")
+            .join(format!("{token_id}.json"))
+    }
+
+    /// The valid record stored at `path` as `token_id`, under the caller's Registry lock.
+    fn stored_access_token(
+        &self,
+        path: &Path,
+        token_id: &str,
+    ) -> io::Result<Option<crate::AccessTokenRecord>> {
+        let bytes = match fs::read(path) {
+            Ok(bytes) if self.limits.tokens.record_bytes.allows(bytes.len()) => bytes,
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let Ok(record) = serde_json::from_slice::<crate::AccessTokenRecord>(&bytes) else {
+            return Ok(None);
+        };
+        let Ok(record) = validate_access_token_record(&record) else {
+            return Ok(None);
+        };
+        Ok((record.token_id() == token_id).then_some(record))
+    }
+}
+
+/// Cables between Agents, their delivery state and send quotas.
+pub trait CableStore {
+    /// Stores a Cable and returns the original record on an identical idempotent retry.
+    ///
+    /// The authenticated sender and idempotency key form the unique request key. Reuse
+    /// with different immutable content returns `AlreadyExists`.
+    fn submit_cable(&self, cable: &Cable) -> io::Result<Cable>;
+
+    /// Finds an accepted Cable by its authenticated sender and idempotency key.
+    fn find_cable(&self, sender_agent: &str, idempotency_key: &str) -> io::Result<Option<Cable>>;
+
+    /// Reads a Cable by its relay-generated identifier.
+    fn get_cable(&self, cable_id: &str) -> io::Result<Option<Cable>>;
+
+    /// Returns unexpired queued or delivered Cables for an Agent Session.
+    ///
+    /// `limit` must be between 1 and 1,000. A recipient with no provider Session is
+    /// visible to the Agent's current Session.
+    fn cable_inbox(
+        &self,
+        agent: &str,
+        session_id: Option<&str>,
+        limit: usize,
+        now: Option<f64>,
+    ) -> io::Result<Vec<Cable>>;
+
+    /// Returns unexpired Cables with at least one held recipient.
+    fn held_cables(&self, limit: usize, now: Option<f64>) -> io::Result<Vec<Cable>>;
+
+    /// Atomically changes one recipient's state and returns the updated Cable; `taken_by` records
+    /// the Session that took a delivery addressed to the Agent as a whole.
+    fn update_cable_delivery(
+        &self,
+        cable_id: &str,
+        agent: &str,
+        session_id: Option<&str>,
+        state: CableState,
+        taken_by: Option<&str>,
+        now: Option<f64>,
+    ) -> io::Result<Option<Cable>>;
+
+    /// The unexpired Cables `sender_agent` sent, oldest first, at most `limit`.
+    fn cables_from(
+        &self,
+        sender_agent: &str,
+        limit: usize,
+        now: Option<f64>,
+    ) -> io::Result<Vec<Cable>>;
+
+    /// Atomically consumes one token from every shared Cable quota bucket.
+    ///
+    /// Keys are SHA-256 hashed before being written to `cable-quotas.json`, matching I
+    /// Registry while keeping caller-provided keys out of the file.
+    fn take_quotas(&self, buckets: &[(&str, f64, u32)], now: f64) -> io::Result<bool>;
+}
+
+impl CableStore for FileRegistry {
+    fn submit_cable(&self, cable: &Cable) -> io::Result<Cable> {
+        let _registry_lock = self.lock()?;
+        for existing in self.scan_cables()? {
+            if existing.sender_agent() == cable.sender_agent()
+                && existing.idempotency_key() == cable.idempotency_key()
+            {
+                if existing.same_request(cable) {
+                    return Ok(existing);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "Cable idempotency key was reused for different content",
+                ));
+            }
+        }
+
+        let path = self
+            .root
+            .join("cables")
+            .join(format!("{}.json", cable.id()));
+        if path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("Cable {} already exists", cable.id()),
+            ));
+        }
+        let bytes = serde_json::to_vec(cable).map_err(io::Error::other)?;
+        self.write_atomic(&path, &bytes)?;
+        // The Cable is sent either way; its timeline entry is a record, not a condition.
+        let _ = record_event_locked(self, &cable_sent_event(cable));
+        Ok(cable.clone())
+    }
+
+    fn find_cable(&self, sender_agent: &str, idempotency_key: &str) -> io::Result<Option<Cable>> {
+        for cable in self.scan_cables()? {
+            if cable.sender_agent() == sender_agent && cable.idempotency_key() == idempotency_key {
+                return Ok(Some(cable));
+            }
+        }
+        Ok(None)
+    }
+
+    fn get_cable(&self, cable_id: &str) -> io::Result<Option<Cable>> {
+        validate_cable_id(cable_id)?;
+        read_cable(
+            &self.root.join("cables").join(format!("{cable_id}.json")),
+            self.limits.cables.record_bytes,
+        )
+    }
+
+    fn cable_inbox(
+        &self,
+        agent: &str,
+        session_id: Option<&str>,
+        limit: usize,
+        now: Option<f64>,
+    ) -> io::Result<Vec<Cable>> {
+        if agent.trim().is_empty() || limit == 0 || !self.limits.cables.page.allows(limit) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "agent must be non-empty and limit must be between 1 and 1000",
+            ));
+        }
+        let now = now.map_or_else(unix_time, Ok)?;
+        if !now.is_finite() {
+            return Err(invalid_data("Cable inbox time must be finite"));
+        }
+        let mut cables = self
+            .scan_cables()?
+            .into_iter()
+            .filter(|cable| {
+                cable.expires_at() > now
+                    && cable.recipients().iter().any(|recipient| {
+                        recipient.agent() == agent
+                            && recipient
+                                .session_id()
+                                .is_none_or(|target| Some(target) == session_id)
+                            && matches!(
+                                recipient.state(),
+                                CableState::Queued | CableState::Delivered
+                            )
+                    })
+            })
+            .collect::<Vec<_>>();
+        cables.sort_by(|left, right| {
+            left.created_at()
+                .total_cmp(&right.created_at())
+                .then_with(|| left.id().cmp(right.id()))
+        });
+        cables.truncate(limit);
+        Ok(cables)
+    }
+
+    fn cables_from(
+        &self,
+        sender_agent: &str,
+        limit: usize,
+        now: Option<f64>,
+    ) -> io::Result<Vec<Cable>> {
+        if sender_agent.trim().is_empty() || limit == 0 || !self.limits.cables.page.allows(limit) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "sender must be non-empty and limit within [registry.limits.cables] page",
+            ));
+        }
+        let now = now.map_or_else(unix_time, Ok)?;
+        let mut cables = self
+            .scan_cables()?
+            .into_iter()
+            .filter(|cable| cable.expires_at() > now && cable.sender_agent() == sender_agent)
+            .collect::<Vec<_>>();
+        cables.sort_by(|left, right| {
+            left.created_at()
+                .total_cmp(&right.created_at())
+                .then_with(|| left.id().cmp(right.id()))
+        });
+        cables.truncate(limit);
+        Ok(cables)
+    }
+
+    fn held_cables(&self, limit: usize, now: Option<f64>) -> io::Result<Vec<Cable>> {
+        if limit == 0 || !self.limits.cables.page.allows(limit) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "held Cable limit is outside [registry.limits.cables] page",
+            ));
+        }
+        let now = now.map_or_else(unix_time, Ok)?;
+        if !now.is_finite() {
+            return Err(invalid_data("held Cable time must be finite"));
+        }
+        let mut cables = self
+            .scan_cables()?
+            .into_iter()
+            .filter(|cable| {
+                cable.expires_at() > now
+                    && cable
+                        .recipients()
+                        .iter()
+                        .any(|recipient| recipient.state() == CableState::Held)
+            })
+            .collect::<Vec<_>>();
+        cables.sort_by(|left, right| {
+            left.created_at()
+                .total_cmp(&right.created_at())
+                .then_with(|| left.id().cmp(right.id()))
+        });
+        cables.truncate(limit);
+        Ok(cables)
+    }
+
+    fn update_cable_delivery(
+        &self,
+        cable_id: &str,
+        agent: &str,
+        session_id: Option<&str>,
+        state: CableState,
+        taken_by: Option<&str>,
+        now: Option<f64>,
+    ) -> io::Result<Option<Cable>> {
+        validate_cable_id(cable_id)?;
+        let _registry_lock = self.lock()?;
+        let Some(cable) = self.get_cable(cable_id)? else {
+            return Ok(None);
+        };
+        let now = now.map_or_else(unix_time, Ok)?;
+        if !now.is_finite() {
+            return Err(invalid_data("Cable delivery time must be finite"));
+        }
+        let next_state = if cable.expires_at() <= now && state != CableState::Expired {
+            CableState::Expired
+        } else {
+            state
+        };
+        let Some(updated) = cable
+            .with_recipient_taken(agent, session_id, next_state, taken_by)
+            .map_err(cable_error)?
+        else {
+            return Ok(None);
+        };
+        let path = self
+            .root
+            .join("cables")
+            .join(format!("{}.json", updated.id()));
+        let bytes = serde_json::to_vec(&updated).map_err(io::Error::other)?;
+        self.write_atomic(&path, &bytes)?;
+        Ok(Some(updated))
+    }
+
+    fn take_quotas(&self, buckets: &[(&str, f64, u32)], now: f64) -> io::Result<bool> {
+        check_quota_buckets(buckets, now)?;
+        let _registry_lock = self.lock()?;
+        let path = self.root.join("cable-quotas.json");
+        let mut saved = fs::read(&path)
+            .ok()
+            .and_then(|bytes| {
+                serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&bytes).ok()
+            })
+            .unwrap_or_default();
+        let balances = quota_balances(buckets, now, |key| {
+            Ok(saved.get(key).and_then(|value| {
+                let values = value.as_array()?;
+                if values.len() != 2 {
+                    return None;
+                }
+                Some((values[0].as_f64()?, values[1].as_f64()?))
+            }))
+        })?;
+        let allowed = quota_allows(&balances);
+        for balance in balances {
+            match balance.remaining(allowed) {
+                Some(tokens) => saved.insert(balance.key, serde_json::json!([tokens, now])),
+                None => saved.remove(&balance.key),
+            };
+        }
+        let bytes = serde_json::to_vec(&saved).map_err(io::Error::other)?;
+        self.write_atomic(&path, &bytes)?;
+        Ok(allowed)
+    }
+}
+
+/// Metadata-only audit records.
+pub trait AuditStore {
+    /// Stores one metadata-only audit event without retaining request content.
+    fn record_audit(&self, entry: &AuditRecord) -> io::Result<()>;
+
+    /// Returns the newest audit events, bounded to 500 metadata-only entries.
+    fn list_audit(&self, limit: usize) -> io::Result<Vec<AuditRecord>>;
+
+    /// Returns every stored audit event, in no particular order; at most 10,000 exist.
+    fn audit_records(&self) -> io::Result<Vec<AuditRecord>>;
+}
+
+impl AuditStore for FileRegistry {
+    fn record_audit(&self, entry: &AuditRecord) -> io::Result<()> {
+        entry.validate()?;
+        let _registry_lock = self.lock()?;
+        let directory = self.root.join("audit");
+        fs::create_dir_all(&directory)?;
+        let path = directory.join(format!("{}.json", entry.id));
+        if path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "audit entry ID already exists",
+            ));
+        }
+        let bytes = serde_json::to_vec_pretty(entry).map_err(io::Error::other)?;
+        if !self.limits.audit.record_bytes.allows(bytes.len()) {
+            return Err(invalid_data("audit entry exceeds the size limit"));
+        }
+        self.write_atomic(&path, &bytes)?;
+        Ok(())
+    }
+
+    fn list_audit(&self, limit: usize) -> io::Result<Vec<AuditRecord>> {
+        if limit == 0 || !self.limits.audit.results.allows(limit) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "audit result limit must be between 1 and {}",
+                    self.limits.audit.results
+                ),
+            ));
+        }
+        let mut records = self.audit_records()?;
+        records.sort_by(|left, right| {
+            right
+                .at
+                .total_cmp(&left.at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        records.truncate(limit);
+        Ok(records)
+    }
+
+    fn audit_records(&self) -> io::Result<Vec<AuditRecord>> {
+        let directory = self.root.join("audit");
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut paths = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_type()?.is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+            {
+                if !self.limits.audit.records.allows(paths.len() + 1) {
+                    return Err(invalid_data(format!(
+                        "Registry has more than {} audit entries",
+                        self.limits.audit.records
+                    )));
+                }
+                paths.push(entry.path());
+            }
+        }
+        let mut records = Vec::new();
+        for path in paths {
+            let Ok(metadata) = fs::metadata(&path) else {
+                continue;
+            };
+            if !self.limits.audit.record_bytes.allows(metadata.len()) {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            let Ok(entry) = serde_json::from_slice::<AuditRecord>(&bytes) else {
+                continue;
+            };
+            if entry.validate().is_ok() {
+                records.push(entry);
+            }
+        }
+        Ok(records)
+    }
+}
+
+/// The Agent-role overlay an operator edits per Operation.
+pub trait AgentRoleStore {
+    /// Stores an Operation-scoped Agent role override in the shared Registry.
+    fn put_agent_role(&self, operation: &str, role: &AgentRole) -> io::Result<()>;
+
+    /// Loads role overrides for one Operation in stable role-ID order.
+    fn list_agent_roles(&self, operation: &str) -> io::Result<Vec<AgentRole>>;
+
+    /// Finds an Operation role override by canonical or qualified role identifier.
+    fn agent_role(&self, operation: &str, key: &str) -> io::Result<Option<AgentRole>>;
+
+    /// Removes an Operation-scoped role override, returning whether one existed.
+    fn remove_agent_role(&self, operation: &str, role_id: &str) -> io::Result<bool>;
+}
+
+impl AgentRoleStore for FileRegistry {
+    fn put_agent_role(&self, operation: &str, role: &AgentRole) -> io::Result<()> {
+        validate_registry_key(operation)?;
+        validate_registry_key(&role.id)?;
+        role.validate()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        let bytes = serde_json::to_vec_pretty(role).map_err(io::Error::other)?;
+        if !self.limits.agent_roles.record_bytes.allows(bytes.len()) {
+            return Err(invalid_data(
+                "Agent role configuration exceeds the size limit",
+            ));
+        }
+        let _registry_lock = self.lock()?;
+        let directory = self.root.join("agent-roles").join(operation);
+        fs::create_dir_all(&directory)?;
+        let current = fs::read_dir(&directory)?;
+        let mut count = 0;
+        for entry in current {
+            if entry?.file_type()?.is_file() {
+                count += 1;
+            }
+        }
+        let path = directory.join(format!("{}.json", role.id));
+        if !path.exists() && !self.limits.agent_roles.records.allows(count + 1) {
+            return Err(invalid_data(format!(
+                "Operation has reached the {} Agent role limit",
+                self.limits.agent_roles.records
+            )));
+        }
+        self.write_atomic(&path, &bytes)
+    }
+
+    fn list_agent_roles(&self, operation: &str) -> io::Result<Vec<AgentRole>> {
+        validate_registry_key(operation)?;
+        let directory = self.root.join("agent-roles").join(operation);
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut paths = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_type()?.is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+            {
+                if !self.limits.agent_roles.records.allows(paths.len() + 1) {
+                    return Err(invalid_data(format!(
+                        "Operation has more than {} Agent roles",
+                        self.limits.agent_roles.records
+                    )));
+                }
+                paths.push(entry.path());
+            }
+        }
+        let mut roles = Vec::new();
+        for path in paths {
+            let metadata = fs::metadata(&path)?;
+            if !self.limits.agent_roles.record_bytes.allows(metadata.len()) {
+                continue;
+            }
+            let bytes = fs::read(&path)?;
+            let Ok(role) = serde_json::from_slice::<AgentRole>(&bytes) else {
+                continue;
+            };
+            if role.validate().is_ok()
+                && path.file_stem().and_then(|stem| stem.to_str()) == Some(role.id.as_str())
+            {
+                roles.push(role);
+            }
+        }
+        roles.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(roles)
+    }
+
+    fn agent_role(&self, operation: &str, key: &str) -> io::Result<Option<AgentRole>> {
+        let roles = self.list_agent_roles(operation)?;
+        Ok(roles
+            .into_iter()
+            .filter(|role| key == role.id || key.starts_with(&format!("{}/", role.id)))
+            .max_by_key(|role| role.id.len()))
+    }
+
+    fn remove_agent_role(&self, operation: &str, role_id: &str) -> io::Result<bool> {
+        validate_registry_key(operation)?;
+        validate_registry_key(role_id)?;
+        let _registry_lock = self.lock()?;
+        let path = self
+            .root
+            .join("agent-roles")
+            .join(operation)
+            .join(format!("{role_id}.json"));
+        match fs::remove_file(path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+pub(super) fn validate_registry_key(key: &str) -> io::Result<()> {
+    if key.is_empty()
+        || !key.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | '-')
+        })
+        || key == "."
+        || key == ".."
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Registry key must contain only ASCII letters, digits, '.', '_' or '-'",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_audit_text(value: &str, max_bytes: usize, field: &str) -> io::Result<()> {
+    if value.trim().is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("audit {field} must be non-empty, bounded and contain no controls"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_audit_action(action: &str) -> io::Result<()> {
+    if action.is_empty()
+        || action.len() > 128
+        || !action.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "audit action must be a bounded lowercase identifier",
+        ));
+    }
+    Ok(())
+}
+
+/// The outcome filed for a brief whose last allowed attempt was lost with its Station.
+pub(super) fn lost_outcome(lease: &Lease, by: &str) -> serde_json::Value {
+    serde_json::json!({
+        "state": "lost",
+        "reason": format!("station {} went dark; {} attempts spent", lease.station(), lease.attempt()),
+        "recovered_by": by,
+    })
+}
+
+/// The stored form of a check-in: `info` without its reserved keys, stamped with the
+/// Station and `seen` (Unix seconds), as pretty JSON within the size limit.
+pub(super) fn check_in_record(
+    station: &str,
+    mut info: BTreeMap<String, serde_json::Value>,
+    seen: f64,
+    limits: &StationLimits,
+) -> io::Result<Vec<u8>> {
+    validate_station_id(station)?;
+    info.remove("station");
+    info.remove("seen");
+    let record = StationRecord {
+        info,
+        station: station.to_owned(),
+        seen,
+    };
+    let bytes = serde_json::to_vec_pretty(&record).map_err(io::Error::other)?;
+    if !limits.record_bytes.allows(bytes.len()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "station record exceeds the size limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Checks settings before they are stored for `station`.
+pub(super) fn check_settings(
+    station: &str,
+    settings: &StationSettings,
+    limits: &StationLimits,
+) -> io::Result<()> {
+    validate_station_id(station)?;
+    StationSettings::try_new(settings.station.clone(), settings.max_concurrent_missions)?
+        .with_resource_limits(settings.resource_limits)?;
+    if !limits
+        .mission_capacity
+        .allows(settings.max_concurrent_missions)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Station Mission capacity must be between 1 and {}",
+                limits.mission_capacity
+            ),
+        ));
+    }
+    if station != settings.station {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Station settings identity does not match",
+        ));
+    }
+    Ok(())
+}
+
+/// Checks a request for the Headquarters lease.
+pub(super) fn check_election(station: &str, ttl: Duration) -> io::Result<()> {
+    validate_station_id(station)?;
+    if ttl.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Headquarters lease duration must be positive",
+        ));
+    }
+    Ok(())
+}
+
+/// The Headquarters lease after `station` asks for it at `now`: renewed with the same term
+/// when it holds the lease, taken with the next term when the holder's lapsed, and `None`
+/// while another Station's lease is live.
+pub(super) fn elected(
+    current: Option<&HeadquartersLease>,
+    station: &str,
+    ttl: Duration,
+    now: f64,
+) -> Option<HeadquartersLease> {
+    let expires = now + ttl.as_secs_f64();
+    match current {
+        Some(held) if held.station == station => Some(HeadquartersLease {
+            station: station.to_owned(),
+            expires,
+            term: held.term,
+        }),
+        Some(held) if held.expires >= now => None,
+        _ => Some(HeadquartersLease {
+            station: station.to_owned(),
+            expires,
+            term: current.map_or(0, |lease| lease.term) + 1,
+        }),
+    }
+}
+
+/// Checks Cable quota buckets: a finite time and unique keys with positive rates and bursts.
+pub(super) fn check_quota_buckets(buckets: &[(&str, f64, u32)], now: f64) -> io::Result<()> {
+    if !now.is_finite() || buckets.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Cable quota buckets need a finite time and at least one limit",
+        ));
+    }
+    let mut keys = BTreeSet::new();
+    for (key, rate, capacity) in buckets {
+        if key.is_empty()
+            || !keys.insert(*key)
+            || !rate.is_finite()
+            || *rate <= 0.0
+            || *capacity == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Cable quota needs unique keys, positive rates and positive bursts",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One Cable quota bucket's tokens before a send, keyed by the SHA-256 of its key.
+pub(super) struct QuotaBalance {
+    pub(super) key: String,
+    available: f64,
+    capacity: f64,
+}
+
+impl QuotaBalance {
+    /// The tokens to store after the send, or `None` when the bucket is full again and need
+    /// not be stored.
+    pub(super) fn remaining(&self, allowed: bool) -> Option<f64> {
+        let remaining = if allowed {
+            self.available - 1.0
+        } else {
+            self.available
+        };
+        (remaining < self.capacity).then_some(remaining)
+    }
+}
+
+/// Each bucket's tokens at `now`, refilled since `stored` (tokens, time) last saw it.
+pub(super) fn quota_balances(
+    buckets: &[(&str, f64, u32)],
+    now: f64,
+    mut stored: impl FnMut(&str) -> io::Result<Option<(f64, f64)>>,
+) -> io::Result<Vec<QuotaBalance>> {
+    let mut balances = Vec::with_capacity(buckets.len());
+    for (key, rate, capacity) in buckets {
+        let key = hex_digest(&Sha256::digest(key.as_bytes()));
+        let capacity = f64::from(*capacity);
+        let (tokens, updated) = stored(&key)?
+            .filter(|(tokens, updated)| tokens.is_finite() && updated.is_finite())
+            .unwrap_or((capacity, now));
+        let available = capacity.min(tokens + (now - updated).max(0.0) * rate);
+        balances.push(QuotaBalance {
+            key,
+            available,
+            capacity,
+        });
+    }
+    Ok(balances)
+}
+
+/// Whether every bucket has a token for the send.
+pub(super) fn quota_allows(balances: &[QuotaBalance]) -> bool {
+    balances.iter().all(|balance| balance.available >= 1.0)
+}
+
+/// The timeline entry for a sent Cable: its metadata only, never its body or the target
+/// name the sending Agent chose.
+pub(super) fn cable_sent_event(cable: &Cable) -> TimelineEvent {
+    let mut event = TimelineEvent::new(
+        "cable",
+        "sent",
+        cable.sender_operation(),
+        cable.created_at(),
+    )
+    .station(cable.sender_station())
+    .actor(cable.sender_agent())
+    .detail("cable", cable.id())
+    .detail(
+        "scope",
+        serde_json::to_value(cable.target().scope())
+            .ok()
+            .and_then(|scope| scope.as_str().map(str::to_owned))
+            .unwrap_or_default(),
+    )
+    .detail("recipients", cable.recipients().len().to_string());
+    if let Some(mission) = cable.mission_id() {
+        event = event.mission(mission);
+    }
+    if let Some(session) = cable.session_id() {
+        event = event.session(session);
+    }
+    event
+}
+
+pub(super) fn validate_cable_id(id: &str) -> io::Result<()> {
+    if id.is_empty()
+        || id.chars().count() > 64
+        || !id
+            .chars()
+            .all(|character| character.is_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Cable id must contain at most 64 letters, digits, '-' or '_'",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn hex_digest(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn read_cable(path: &Path, limit: Limit) -> io::Result<Option<Cable>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !limit.allows(bytes.len()) {
+        return Err(invalid_data("Cable record exceeds the size limit"));
+    }
+    let cable = serde_json::from_slice(&bytes).map_err(|error| invalid_data(error.to_string()))?;
+    Ok(Some(cable))
+}
+
+fn read_mission_proposal(path: &Path, limit: Limit) -> io::Result<MissionProposal> {
+    let metadata = fs::metadata(path)?;
+    if !limit.allows(metadata.len()) {
+        return Err(invalid_data("Mission proposal exceeds the size limit"));
+    }
+    let bytes = fs::read(path)?;
+    let proposal: MissionProposal =
+        serde_json::from_slice(&bytes).map_err(|error| invalid_data(error.to_string()))?;
+    proposal
+        .validate()
+        .map_err(|error| invalid_data(error.to_string()))?;
+    Ok(proposal)
+}
+
+pub(super) fn cable_error(error: CableError) -> io::Error {
+    invalid_data(error.to_string())
+}
+
+/// Replaces the file at `path` with `bytes` in one step, keeping its permissions, which another
+/// program reading it depends on.
+pub(crate) fn replace_file(path: &Path, bytes: &[u8], retry: TimeLimit) -> io::Result<()> {
+    let permissions = fs::metadata(path)?.permissions();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    fs::set_permissions(temporary.path(), permissions)?;
+    persist_within(temporary, path, retry)
+}
+
+fn write_atomic_within(path: &Path, bytes: &[u8], retry: TimeLimit) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    persist_within(temporary, path, retry)
+}
+
+fn persist_within(
+    mut temporary: tempfile::NamedTempFile,
+    path: &Path,
+    retry: TimeLimit,
+) -> io::Result<()> {
+    // Windows refuses to replace a file while a reader has it open ("Access is denied");
+    // readers hold it only for a read, so the rename is tried again for a short while.
+    let deadline = retry
+        .get()
+        .and_then(|retry| Instant::now().checked_add(retry));
+    let mut delay = Duration::from_millis(5);
+    loop {
+        match temporary.persist(path) {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if error.error.kind() == io::ErrorKind::PermissionDenied
+                    && deadline.is_none_or(|deadline| Instant::now() < deadline) =>
+            {
+                temporary = error.file;
+                thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_millis(100));
+            }
+            Err(error) => return Err(error.error),
+        }
+    }
+}
+
+pub(super) fn finish_locked(
+    registry: &FileRegistry,
+    brief: &Brief,
+    outcome: &serde_json::Value,
+    ok: bool,
+    transcript: Option<&[u8]>,
+) -> io::Result<()> {
+    let root = registry.root.as_path();
+    let state = if ok { "done" } else { "failed" };
+    let key = brief.key();
+    if let Err(error) = fs::remove_file(root.join("vetting").join(format!("{key}.json")))
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        return Err(error);
+    }
+    let target = root.join(state).join(format!("{key}.json"));
+    let outcome_path = root.join(state).join(format!("{key}.outcome.json"));
+    registry.write_atomic(
+        &outcome_path,
+        &serde_json::to_vec_pretty(outcome).map_err(io::Error::other)?,
+    )?;
+    if let Some(transcript) = transcript {
+        registry.write_atomic(&root.join(state).join(format!("{key}.log")), transcript)?;
+    }
+    // The provenance is spent before the brief moves: a record queued again under this key
+    // finds none, and a crash in between leaves a brief without one, never one with two.
+    let spent = root.join(state).join(format!("{key}.provenance"));
+    match fs::rename(root.join("provenance").join(format!("{key}.json")), &spent) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if let (_, Some(provenance)) = bona_fides::seal(brief)? {
+                registry.write_atomic(
+                    &spent,
+                    &serde_json::to_vec_pretty(&provenance).map_err(io::Error::other)?,
+                )?;
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    if !brief.source.starts_with(SOURCE_BRIEF_PREFIX) {
+        settle_report(registry, state, &key)?;
+    }
+    let source = root.join("claimed").join(format!("{key}.json"));
+    if source.is_file() {
+        fs::rename(source, &target)?;
+    } else {
+        let (record, _) = bona_fides::seal(brief)?;
+        registry.write_atomic(
+            &target,
+            &serde_json::to_vec_pretty(&record).map_err(io::Error::other)?,
+        )?;
+    }
+    if let Err(error) = fs::remove_file(cancel_path(root, &key))
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        return Err(error);
+    }
+    remove_lease(root, &key)
+}
+
+fn remove_lease(root: &Path, key: &str) -> io::Result<()> {
+    match fs::remove_file(root.join("leases").join(format!("{key}.json"))) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+pub(super) fn unix_time() -> io::Result<f64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_secs_f64())
+}
+
+pub(crate) fn validate_station_id(station: &str) -> io::Result<()> {
+    if station.is_empty() || station.len() > 256 || station.chars().any(char::is_control) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "station ID must be non-empty, at most 256 UTF-8 bytes, and contain no control characters",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_access_token_record(
+    record: &crate::AccessTokenRecord,
+) -> io::Result<crate::AccessTokenRecord> {
+    record
+        .with_times(record.expires_at(), record.revoked_at())
+        .map_err(|_| invalid_data("invalid access token record"))
+}
+
+/// `record` revoked at `now`.
+pub(super) fn revoked_token(
+    record: &crate::AccessTokenRecord,
+    now: f64,
+) -> io::Result<crate::AccessTokenRecord> {
+    record
+        .with_times(record.expires_at(), Some(now))
+        .map_err(|_| invalid_data("invalid access token record"))
+}
+
+/// Whether a bearer token's sign-in lets it stand: `cookie` is the record `token` names as its
+/// sign-in, as found. One that cannot be found or read counts as ended.
+pub(super) fn sign_in_stands(
+    token: &crate::AccessTokenRecord,
+    cookie: Option<&crate::AccessTokenRecord>,
+) -> bool {
+    match (token.sign_in(), cookie) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(_), Some(cookie)) => {
+            cookie.is_session_cookie()
+                && cookie.revoked_at().is_none()
+                && cookie.person_id() == token.person_id()
+        }
+    }
+}
+
+/// `record` with `expires_at` when that is later, `None` when it is not active at `now`.
+pub(super) fn extended_token(
+    record: &crate::AccessTokenRecord,
+    expires_at: f64,
+    now: f64,
+) -> io::Result<Option<crate::AccessTokenRecord>> {
+    if !expires_at.is_finite() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "an access token's expiry must be a finite time",
+        ));
+    }
+    if record.is_session_cookie() || !record.active_at(now) {
+        return Ok(None);
+    }
+    record
+        .with_times(record.expires_at().max(expires_at), record.revoked_at())
+        .map(Some)
+        .map_err(|_| invalid_data("invalid access token record"))
+}
+
+pub(super) fn validate_token_id(token_id: &str) -> io::Result<()> {
+    let parsed = uuid::Uuid::parse_str(token_id)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid token ID"))?;
+    if parsed.to_string() != token_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "token ID must be a canonical lowercase UUID",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_token_digest(digest: &str) -> io::Result<()> {
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "token digest must be lowercase SHA-256 hex",
+        ));
+    }
+    Ok(())
+}
+
+fn registry_station_component(station: &str) -> String {
+    station
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || matches!(character, '_' | '.' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+pub(super) fn read_headquarters(
+    path: &Path,
+    limit: Limit,
+) -> io::Result<Option<HeadquartersLease>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !limit.allows(bytes.len()) {
+        return Err(invalid_data("Headquarters lease exceeds the size limit"));
+    }
+    let record: HeadquartersLeaseFile = serde_json::from_slice(&bytes)
+        .map_err(|error| invalid_data(format!("invalid Headquarters lease: {error}")))?;
+    Ok(Some(record.into_lease()?))
+}
+
+fn write_headquarters(
+    registry: &FileRegistry,
+    path: &Path,
+    lease: &HeadquartersLease,
+) -> io::Result<()> {
+    let bytes = serde_json::to_vec(lease).map_err(io::Error::other)?;
+    if !registry.limits.stations.record_bytes.allows(bytes.len()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Headquarters lease exceeds the size limit",
+        ));
+    }
+    registry.write_atomic(path, &bytes)
+}
+
+fn registry_lock(root: &Path, wait: TimeLimit) -> io::Result<File> {
+    fs::create_dir_all(root)?;
+    let path = root.join(".ai6-registry.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .open(path)?;
+    #[cfg(windows)]
+    let file = {
+        let mut file = file;
+        // Another handle may have written the byte and locked it between the length check
+        // and this write; Windows then refuses the write (lock violation), which is fine.
+        if file.metadata()?.len() == 0
+            && let Err(error) = file.write_all(b"\0").and_then(|()| file.flush())
+            && !lock_is_contended(&error)
+        {
+            return Err(error);
+        }
+        file
+    };
+    let deadline = wait.get().and_then(|wait| Instant::now().checked_add(wait));
+    let open =
+        |deadline: Option<Instant>| deadline.is_none_or(|deadline| Instant::now() < deadline);
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(file),
+            Err(error) if lock_is_contended(&error) && open(deadline) => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) if !open(deadline) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("timed out locking the Registry: {error}"),
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn lock_is_contended(error: &io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::PermissionDenied
+    ) {
+        return true;
+    }
+    #[cfg(windows)]
+    return matches!(error.raw_os_error(), Some(32 | 33));
+    #[cfg(not(windows))]
+    false
+}
+
+pub(super) fn safe_component(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut replacing = false;
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | '-') {
+            result.push(character);
+            replacing = false;
+        } else if !replacing {
+            result.push('_');
+            replacing = true;
+        }
+    }
+    result
+}
+
+fn default_id() -> String {
+    "unknown".to_owned()
+}
+
+fn default_source() -> String {
+    "manual".to_owned()
+}
+
+fn default_version() -> u32 {
+    BRIEF_VERSION
+}
+
+pub(super) fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn how_many_cables_one_read_takes_is_a_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut limits = RegistryLimits::default();
+        assert_eq!(limits.cables.page, Limit::at(1_000));
+        limits.cables.page = Limit::at(2);
+        let registry = FileRegistry::open(dir.path()).with_limits(limits.clone());
+        assert!(registry.held_cables(2, Some(1.0)).is_ok());
+        let refused = registry.held_cables(3, Some(1.0)).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::InvalidInput);
+        assert!(registry.cable_inbox("008", None, 3, Some(1.0)).is_err());
+        limits.cables.page = Limit::UNBOUNDED;
+        let registry = FileRegistry::open(dir.path()).with_limits(limits);
+        assert!(registry.held_cables(5_000, Some(1.0)).is_ok());
+        assert!(registry.cable_inbox("008", None, 5_000, Some(1.0)).is_ok());
+    }
+
+    use super::*;
+    use crate::directorates::registry::cables::{
+        CableDraft, CableRecipient, CableScope, CableTarget,
+    };
+    use crate::directorates::registry::sources::SourceItem;
+    use crate::directorates::registry::suite::{Store, backend_tests, brief, lapse};
+    use std::fs;
+
+    fn test_cable(id: &str, key: &str, body: &str, session_id: &str) -> Cable {
+        Cable::try_new(
+            CableDraft::new(
+                "007".into(),
+                "operation-a".into(),
+                "station-a".into(),
+                CableTarget::try_new(CableScope::Agent, Some("008".into())).unwrap(),
+                body.into(),
+                vec![
+                    CableRecipient::try_new(
+                        "008".into(),
+                        Some(session_id.into()),
+                        CableState::Queued,
+                    )
+                    .unwrap(),
+                ],
+                key.into(),
+                id.into(),
+                1_700_000_000.0,
+                1_700_000_900.0,
+            ),
+            &Default::default(),
+        )
+        .unwrap()
+    }
+
+    fn test_agent_role(id: &str, purpose: &str) -> AgentRole {
+        AgentRole {
+            require_approval_before_done: false,
+            deliverables: Vec::new(),
+            id: id.to_owned(),
+            purpose: purpose.to_owned(),
+            policy: "Follow the Operation policy.".to_owned(),
+            review: Default::default(),
+        }
+    }
+
+    fn proposal(retry_key: &str, title: &str, role: Option<&str>) -> MissionProposal {
+        MissionProposal::try_new(
+            "operation-a",
+            MissionId::try_new("parent-mission").unwrap(),
+            "coordinator",
+            SessionId::try_new("provider-session").unwrap(),
+            retry_key,
+            Brief {
+                title: title.to_owned(),
+                body: "Bounded child brief".to_owned(),
+                id: "child".to_owned(),
+                mission_id: None,
+                handle: None,
+                name: None,
+                source: "agent".to_owned(),
+                operation: Some("ignored-operation".to_owned()),
+                agent: None,
+                role: role.map(str::to_owned),
+                tags: Vec::new(),
+                stations: Vec::new(),
+                priority: 0,
+                url: None,
+                data: BTreeMap::new(),
+                created: String::new(),
+                version: 1,
+                provenance: None,
+            },
+            &Default::default(),
+        )
+        .unwrap()
+    }
+
+    fn source_item(id: &str) -> SourceItem {
+        SourceItem {
+            id: id.to_owned(),
+            title: "Fix the build".to_owned(),
+            body: "It fails.".to_owned(),
+            url: None,
+            labels: Vec::new(),
+            author: None,
+            updated: "2026-01-01T00:00:00Z".to_owned(),
+            code: None,
+            code_tag: None,
+        }
+    }
+
+    fn access_token(now: f64) -> crate::AccessTokenRecord {
+        let secret = "ai6_device_secret_0123456789abcdef";
+        let digest = Sha256::digest([b"ai6-access-token\0".as_slice(), secret.as_bytes()].concat())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        crate::AccessTokenRecord::try_new(
+            "e747dbba-9a28-4463-a1ab-e31ed79d8991",
+            digest,
+            "person-007",
+            now,
+            now + 3_600.0,
+            None,
+        )
+        .unwrap()
+    }
+
+    backend_tests!(
+        operation_agent_role_overrides_are_validated_and_isolated,
+        check_ins_replace_reserved_keys_and_list_recent_stations,
+        headquarters_election_has_one_winner_and_renews_the_winner,
+        the_headquarters_term_grows_on_takeover_and_survives_renewal,
+        site_check_in_rejects_invalid_identity_and_oversized_metadata,
+        station_settings_are_validated_persisted_and_isolated_by_identity,
+        queued_briefs_list_by_priority_creation_time_and_key,
+        mission_proposals_are_idempotent_operation_scoped_and_not_runnable,
+        mission_proposal_identity_cannot_be_reused_for_different_content,
+        proposal_approval_promotes_once_and_rejection_stays_out_of_intake,
+        submit_brief_writes_once_to_shared_queue,
+        audit_entries_are_metadata_only_bounded_and_sorted_newest_first,
+        one_station_claims_a_brief,
+        a_leased_claim_is_listed_and_renewed_only_by_its_holder,
+        finish_requires_the_current_station_and_files_the_outcome,
+        a_cancel_is_kept_from_its_first_request_until_the_brief_finishes,
+        a_filed_brief_is_read_in_any_state,
+        expired_leases_requeue_or_fail_at_the_attempt_limit,
+        an_expired_lease_is_handed_over_once_with_its_claim_and_attempt,
+        leased_claim_is_exclusive_and_registry_keys_are_checked,
+        cable_store_is_idempotent_and_rejects_conflicting_retries,
+        cable_inbox_and_delivery_updates_follow_session_and_expiry,
+        cable_quotas_are_atomic_and_shared,
+        access_tokens_are_shared_by_registries_and_revocation_is_immediate,
+        an_access_token_is_extended_never_shortened,
+        a_session_cookie_is_no_bearer_and_revoking_ends_its_whole_sign_in,
+    );
+
+    fn operation_agent_role_overrides_are_validated_and_isolated(store: &dyn Store) {
+        let registry = store.handle();
+        let first = test_agent_role("reviewer", "Review changes");
+        registry.put_agent_role("operation-a", &first).unwrap();
+
+        assert_eq!(
+            registry.list_agent_roles("operation-a").unwrap(),
+            vec![first.clone()]
+        );
+        assert!(
+            registry
+                .agent_role("operation-a", "reviewer/security")
+                .unwrap()
+                .is_some()
+        );
+        assert!(registry.list_agent_roles("operation-b").unwrap().is_empty());
+
+        let updated = test_agent_role("reviewer", "Review security changes");
+        registry.put_agent_role("operation-a", &updated).unwrap();
+        assert_eq!(
+            registry.list_agent_roles("operation-a").unwrap(),
+            vec![updated]
+        );
+
+        let invalid = test_agent_role("../escape", "Invalid role");
+        assert!(registry.put_agent_role("operation-a", &invalid).is_err());
+        assert!(
+            registry
+                .remove_agent_role("operation-a", "reviewer")
+                .unwrap()
+        );
+        assert!(
+            !registry
+                .remove_agent_role("operation-a", "reviewer")
+                .unwrap()
+        );
+    }
+
+    fn check_ins_replace_reserved_keys_and_list_recent_stations(store: &dyn Store) {
+        let registry = store.handle();
+        let mut info = BTreeMap::new();
+        info.insert("station_count".to_owned(), serde_json::json!(3));
+        info.insert("station".to_owned(), serde_json::json!("forged"));
+        info.insert("seen".to_owned(), serde_json::json!(-1));
+        let before = unix_time().unwrap();
+
+        registry.check_in("Stätion/one", info).unwrap();
+
+        let stations = store.handle().stations(DEFAULT_LEASE).unwrap();
+        assert_eq!(stations.len(), 1);
+        assert_eq!(stations[0].station(), "Stätion/one");
+        assert_eq!(stations[0].info()["station_count"], 3);
+        assert!(!stations[0].info().contains_key("station"));
+        // A SQL Registry stamps the database's clock, to the millisecond.
+        assert!((stations[0].seen() - before).abs() < 60.0);
+        registry.check_in("Stätion/one", BTreeMap::new()).unwrap();
+        assert!(
+            registry.stations(DEFAULT_LEASE).unwrap()[0]
+                .info()
+                .is_empty(),
+            "a check-in replaces the last one"
+        );
+    }
+
+    fn headquarters_election_has_one_winner_and_renews_the_winner(store: &dyn Store) {
+        let first = store.handle();
+        let second = store.handle();
+        let first_thread =
+            std::thread::spawn(move || first.elect("station-a", DEFAULT_LEASE).unwrap());
+        let second_thread =
+            std::thread::spawn(move || second.elect("station-b", DEFAULT_LEASE).unwrap());
+        let won = [first_thread.join().unwrap(), second_thread.join().unwrap()];
+
+        assert_eq!(won.iter().filter(|won| **won).count(), 1);
+        let registry = store.handle();
+        let current = registry.headquarters().unwrap().unwrap();
+        let winner = if won[0] { "station-a" } else { "station-b" };
+        let loser = if won[0] { "station-b" } else { "station-a" };
+        assert_eq!(current.station(), winner);
+        assert!(!registry.elect(loser, DEFAULT_LEASE).unwrap());
+        assert!(registry.elect(winner, DEFAULT_LEASE).unwrap());
+        assert!(registry.headquarters().unwrap().unwrap().expires() >= current.expires());
+    }
+
+    fn the_headquarters_term_grows_on_takeover_and_survives_renewal(store: &dyn Store) {
+        let registry = store.handle();
+        assert!(registry.headquarters().unwrap().is_none());
+        assert!(registry.elect("station-a", DEFAULT_LEASE).unwrap());
+        assert_eq!(registry.headquarters().unwrap().unwrap().term(), 1);
+        assert!(registry.elect("station-a", DEFAULT_LEASE).unwrap());
+        assert_eq!(registry.headquarters().unwrap().unwrap().term(), 1);
+
+        // The holder's last renewal runs out; another Station takes over in the next term.
+        assert!(
+            registry
+                .elect("station-a", Duration::from_nanos(1))
+                .unwrap()
+        );
+        // Expiry is the backend's call: SQL judges it by the database's clock.
+        let standby = store.handle();
+        crate::directorates::registry::suite::until(|| {
+            standby
+                .elect("station-b", DEFAULT_LEASE)
+                .unwrap()
+                .then_some(())
+        });
+        let taken = registry.headquarters().unwrap().unwrap();
+        assert_eq!((taken.station(), taken.term()), ("station-b", 2));
+        assert!(!registry.elect("station-a", DEFAULT_LEASE).unwrap());
+    }
+
+    fn site_check_in_rejects_invalid_identity_and_oversized_metadata(store: &dyn Store) {
+        let registry = store.handle();
+        assert_eq!(
+            registry
+                .check_in("bad\nsite", BTreeMap::new())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        let mut info = BTreeMap::new();
+        info.insert(
+            "payload".to_owned(),
+            serde_json::Value::String("x".repeat(1_048_576)),
+        );
+        assert_eq!(
+            registry.check_in("station-a", info).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    fn station_settings_are_validated_persisted_and_isolated_by_identity(store: &dyn Store) {
+        let registry = store.handle();
+        let first = StationSettings::try_new("station/a", 7).unwrap();
+        let second = StationSettings::try_new("station?a", 9).unwrap();
+
+        assert_eq!(registry.station_settings("station/a").unwrap(), None);
+        registry.set_station_settings("station/a", &first).unwrap();
+        registry.set_station_settings("station?a", &second).unwrap();
+        assert_eq!(
+            registry.station_settings("station/a").unwrap(),
+            Some(first.clone())
+        );
+        assert_eq!(
+            store.handle().station_settings("station?a").unwrap(),
+            Some(second)
+        );
+        assert!(StationSettings::try_new("station/a", 0).is_err());
+        let crowded = StationSettings::try_new("station/a", 1_025).unwrap();
+        assert_eq!(
+            registry
+                .set_station_settings("station/a", &crowded)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput,
+            "past [registry.limits.stations] mission_capacity"
+        );
+        assert!(registry.set_station_settings("station?a", &first).is_err());
+
+        // Resource limits default and persist.
+        assert_eq!(first.resource_limits(), ResourceLimits::default());
+        let loose = first
+            .clone()
+            .with_resource_limits(ResourceLimits::new(0, 100))
+            .unwrap();
+        registry.set_station_settings("station/a", &loose).unwrap();
+        assert_eq!(
+            registry
+                .station_settings("station/a")
+                .unwrap()
+                .unwrap()
+                .resource_limits(),
+            ResourceLimits::new(0, 100)
+        );
+        assert!(
+            first
+                .with_resource_limits(ResourceLimits::new(0, 101))
+                .is_err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_atomic_write_waits_for_a_reader_that_holds_the_file_without_sharing_it() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("record.json");
+        fs::write(&path, b"old").unwrap();
+        let reader = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            drop(reader);
+        });
+        FileRegistry::open(directory.path())
+            .write_atomic(&path, b"new")
+            .unwrap();
+        release.join().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+    }
+
+    fn queued_briefs_list_by_priority_creation_time_and_key(store: &dyn Store) {
+        let registry = store.handle();
+        for brief in [
+            r#"{"title":"low","id":"low","priority":2,"created":"2026-01-01"}"#,
+            r#"{"title":"high late","id":"late","priority":9,"created":"2026-02-01"}"#,
+            r#"{"title":"high early b","id":"early-b","priority":9,"created":"2026-01-01"}"#,
+            r#"{"title":"high early a","id":"early-a","priority":9,"created":"2026-01-01"}"#,
+        ] {
+            registry
+                .submit_brief(&serde_json::from_str(brief).unwrap())
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .handle()
+                .list_new()
+                .unwrap()
+                .iter()
+                .map(|brief| brief.title.as_str())
+                .collect::<Vec<_>>(),
+            ["high early a", "high early b", "high late", "low"]
+        );
+    }
+
+    fn mission_proposals_are_idempotent_operation_scoped_and_not_runnable(store: &dyn Store) {
+        let registry = store.handle();
+        let proposal = proposal("child-1", "Inspect the role catalog", Some("analyst"));
+
+        registry.submit_mission_proposal(&proposal).unwrap();
+        // A repeat of the same proposal is accepted and stores nothing new.
+        registry.submit_mission_proposal(&proposal).unwrap();
+
+        assert_eq!(registry.list_new().unwrap(), []);
+        let proposals = registry.list_mission_proposals("operation-a", 10).unwrap();
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].id, proposal.id);
+        assert_eq!(proposals[0].brief.operation.as_deref(), Some("operation-a"));
+        assert_eq!(
+            registry.list_mission_proposals("operation-b", 10).unwrap(),
+            []
+        );
+    }
+
+    fn mission_proposal_identity_cannot_be_reused_for_different_content(store: &dyn Store) {
+        let registry = store.handle();
+        registry
+            .submit_mission_proposal(&proposal("same-retry-key", "First brief", None))
+            .unwrap();
+
+        assert_eq!(
+            registry
+                .submit_mission_proposal(&proposal("same-retry-key", "Different brief", None))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+    }
+
+    fn proposal_approval_promotes_once_and_rejection_stays_out_of_intake(store: &dyn Store) {
+        let registry = store.handle();
+        let approved = proposal("approve-key", "Approved work", Some("analyst"));
+        let rejected = proposal("reject-key", "Rejected work", Some("analyst"));
+        registry.submit_mission_proposal(&approved).unwrap();
+        registry.submit_mission_proposal(&rejected).unwrap();
+
+        let promoted = registry
+            .promote_mission_proposal("operation-a", &approved.id, "station-a")
+            .unwrap();
+
+        let provenance = promoted
+            .provenance
+            .clone()
+            .expect("an approval records its origin");
+        assert_eq!(provenance.origin, bona_fides::Origin::Proposal);
+        assert_eq!(provenance.principal.as_deref(), Some("coordinator"));
+        assert_eq!(provenance.reference.as_deref(), Some("provider-session"));
+        assert_eq!(provenance.received_by, "station-a");
+        assert_eq!(
+            Brief {
+                mission_id: None,
+                handle: None,
+                provenance: None,
+                ..promoted.clone()
+            },
+            approved.brief
+        );
+        assert_eq!(promoted.shown_handle(), "operation-a-1");
+        assert_eq!(
+            registry
+                .promote_mission_proposal("operation-a", &approved.id, "station-a")
+                .unwrap(),
+            promoted
+        );
+        assert_eq!(registry.list_new().unwrap(), [promoted]);
+        let pending = registry.list_mission_proposals("operation-a", 10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, rejected.id);
+
+        let declined = registry
+            .reject_mission_proposal("operation-a", &rejected.id)
+            .unwrap();
+
+        assert_eq!(declined.id, rejected.id);
+        assert_eq!(
+            registry
+                .reject_mission_proposal("operation-a", &rejected.id)
+                .unwrap(),
+            declined
+        );
+        assert!(
+            registry
+                .list_mission_proposals("operation-a", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(registry.list_new().unwrap().len(), 1);
+        assert_eq!(
+            registry
+                .promote_mission_proposal("operation-a", &rejected.id, "station-a")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            registry
+                .reject_mission_proposal("operation-a", &approved.id)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            registry
+                .promote_mission_proposal("operation-a", "proposal-unknown", "station-a")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    fn submit_brief_writes_once_to_shared_queue(store: &dyn Store) {
+        let registry = store.handle();
+        let brief = Brief {
+            title: "Review the control pane".to_owned(),
+            body: "Check the Operation context.".to_owned(),
+            id: "mission-123".to_owned(),
+            mission_id: None,
+            handle: None,
+            name: None,
+            source: "universal-exports".to_owned(),
+            operation: Some("operation-a".to_owned()),
+            agent: None,
+            role: Some("implement".to_owned()),
+            tags: vec!["ui".to_owned()],
+            stations: Vec::new(),
+            priority: 0,
+            url: None,
+            data: BTreeMap::new(),
+            created: String::new(),
+            version: 1,
+            provenance: None,
+        };
+
+        registry.submit_brief(&brief).unwrap();
+        let queued = store.handle().list_new().unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0], brief);
+        assert_eq!(
+            registry.submit_brief(&brief).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+    }
+
+    fn audit_entries_are_metadata_only_bounded_and_sorted_newest_first(store: &dyn Store) {
+        let registry = store.handle();
+        let older = AuditRecord {
+            id: "event-1".to_owned(),
+            actor: "operator-007".to_owned(),
+            action: "mission.create".to_owned(),
+            operation: "operation-a".to_owned(),
+            resource: None,
+            target: "universal-exports--mission-1".to_owned(),
+            at: 100.0,
+        };
+        let newer = AuditRecord {
+            id: "event-2".to_owned(),
+            at: 101.0,
+            ..older.clone()
+        };
+
+        registry.record_audit(&older).unwrap();
+        registry.record_audit(&newer).unwrap();
+        assert_eq!(registry.list_audit(10).unwrap(), [newer, older.clone()]);
+        assert_eq!(
+            registry.record_audit(&older).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            registry.list_audit(501).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            registry
+                .record_audit(&AuditRecord {
+                    target: "prompt\nsecret".to_owned(),
+                    id: "event-3".to_owned(),
+                    ..older
+                })
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(store.handle().audit_records().unwrap().len(), 2);
+    }
+
+    fn one_station_claims_a_brief(store: &dyn Store) {
+        store.handle().submit_brief(&brief("brief-1")).unwrap();
+        let first = store.handle();
+        let second = store.handle();
+        let first_thread = std::thread::spawn(move || first.claim_new(None).unwrap());
+        let second_thread = std::thread::spawn(move || second.claim_new(None).unwrap());
+        let claims = [first_thread.join().unwrap(), second_thread.join().unwrap()];
+
+        assert_eq!(claims.iter().filter(|claim| claim.is_some()).count(), 1);
+        let registry = store.handle();
+        assert!(registry.read_claimed("manual--brief-1").unwrap().is_some());
+        assert!(registry.list_new().unwrap().is_empty());
+    }
+
+    fn a_leased_claim_is_listed_and_renewed_only_by_its_holder(store: &dyn Store) {
+        let registry = store.handle();
+        registry.submit_brief(&brief("brief-1")).unwrap();
+        let mut meta = BTreeMap::new();
+        meta.insert("operation".to_owned(), serde_json::json!("operation-01"));
+
+        let lease = registry
+            .claim_with_lease(None, "operation-01", DEFAULT_LEASE, meta.clone())
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.key(), "manual--brief-1");
+        assert_eq!(lease.station(), "operation-01");
+        assert_eq!(lease.attempt(), 1);
+        assert_eq!(lease.meta(), &meta);
+        assert!(registry.list_new().unwrap().is_empty());
+        assert!(registry.read_claimed(lease.key()).unwrap().is_some());
+
+        let other = store.handle();
+        let reopened = other.lease(lease.key()).unwrap().unwrap();
+        assert_eq!(reopened.key(), lease.key());
+        assert_eq!(reopened.station(), lease.station());
+        assert_eq!(reopened.attempt(), lease.attempt());
+        assert_eq!(reopened.meta(), lease.meta());
+        assert!((reopened.expires() - lease.expires()).abs() < 0.000_001);
+        let listed = other.leases().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].key(), lease.key());
+        assert!(other.expired().unwrap().is_empty());
+
+        assert!(
+            !registry
+                .renew(lease.key(), "operation-02", DEFAULT_LEASE)
+                .unwrap()
+        );
+        assert!(
+            registry
+                .renew(lease.key(), "operation-01", DEFAULT_LEASE)
+                .unwrap()
+        );
+        assert!(registry.lease(lease.key()).unwrap().unwrap().expires() >= lease.expires());
+        assert!(
+            !registry
+                .renew("manual--absent", "operation-01", DEFAULT_LEASE)
+                .unwrap()
+        );
+    }
+
+    fn a_filed_brief_is_read_in_any_state(store: &dyn Store) {
+        let registry = store.handle();
+        let of = |id: &str, operation: &str| {
+            let mut queued = brief(id);
+            queued.operation = Some(operation.to_owned());
+            queued
+        };
+        let queued = of("queued", "B");
+        registry.submit_brief(&queued).unwrap();
+        let filed = registry.filed_brief(&queued.key()).unwrap().unwrap();
+        assert_eq!((filed.state.as_str(), filed.attempts), ("new", 0));
+        assert_eq!(filed.outcome, None);
+        assert_eq!(filed.brief.title, queued.title);
+
+        let worked = of("worked", "B");
+        registry.submit_brief(&worked).unwrap();
+        let lease = registry
+            .claim_with_lease(
+                Some(&worked.key()),
+                "station-a",
+                Duration::from_secs(60),
+                BTreeMap::new(),
+            )
+            .unwrap()
+            .unwrap();
+        let claimed = registry.filed_brief(lease.key()).unwrap().unwrap();
+        assert_eq!((claimed.state.as_str(), claimed.attempts), ("claimed", 1));
+        registry
+            .finish(
+                &claimed.brief,
+                &serde_json::json!({"state": "done", "branch": "work"}),
+                true,
+                None,
+                Some("station-a"),
+            )
+            .unwrap();
+        let done = registry.filed_brief(&worked.key()).unwrap().unwrap();
+        assert_eq!((done.state.as_str(), done.attempts), ("done", 1));
+        assert_eq!(done.outcome.unwrap()["branch"], "work");
+
+        let elsewhere = of("elsewhere", "C");
+        registry.submit_brief(&elsewhere).unwrap();
+        let mut listed: Vec<String> = registry
+            .filed_briefs("B", 10)
+            .unwrap()
+            .into_iter()
+            .map(|filed| filed.brief.id)
+            .collect();
+        listed.sort();
+        assert_eq!(listed, ["queued", "worked"]);
+        assert_eq!(registry.filed_briefs("B", 1).unwrap().len(), 1);
+        assert!(registry.filed_briefs("nowhere", 10).unwrap().is_empty());
+        assert_eq!(registry.filed_brief("no-such-key").unwrap(), None);
+        assert!(registry.filed_brief("../escape").is_err());
+    }
+
+    fn a_cancel_is_kept_from_its_first_request_until_the_brief_finishes(store: &dyn Store) {
+        let registry = store.handle();
+        let queued = brief("cancel-me");
+        registry.submit_brief(&queued).unwrap();
+        let key = queued.key();
+        assert!(
+            !registry.request_cancel(&key, 10.0).unwrap(),
+            "a queued brief has no claim to cancel"
+        );
+        assert!(registry.cancel_requests().unwrap().is_empty());
+        registry
+            .claim_with_lease(Some(&key), "worker", DEFAULT_LEASE, BTreeMap::new())
+            .unwrap()
+            .unwrap();
+        assert!(registry.request_cancel(&key, 10.0).unwrap());
+        assert!(registry.request_cancel(&key, 20.0).unwrap());
+        assert_eq!(
+            registry.cancel_requests().unwrap(),
+            BTreeMap::from([(key.clone(), 10.0)]),
+            "the first request counts"
+        );
+        assert!(
+            registry.request_cancel(&key, f64::NAN).unwrap_err().kind()
+                == io::ErrorKind::InvalidInput
+        );
+        let claimed = registry.read_claimed(&key).unwrap().unwrap();
+        assert!(
+            registry
+                .finish(
+                    &claimed,
+                    &serde_json::json!({"state": "failed"}),
+                    false,
+                    None,
+                    Some("worker")
+                )
+                .unwrap()
+        );
+        assert!(registry.cancel_requests().unwrap().is_empty());
+        assert!(!registry.request_cancel(&key, 30.0).unwrap());
+    }
+
+    fn finish_requires_the_current_station_and_files_the_outcome(store: &dyn Store) {
+        let registry = store.handle();
+        registry
+            .ingest_source_item("G", "github", &source_item("o/r#1"), "station-a")
+            .unwrap();
+        let brief = registry.list_new().unwrap().remove(0);
+        registry
+            .claim_with_lease(
+                Some(&brief.key()),
+                "operation-01",
+                DEFAULT_LEASE,
+                BTreeMap::new(),
+            )
+            .unwrap()
+            .unwrap();
+
+        let outcome = serde_json::json!({"state": "done", "mission_id": "mission-1"});
+        assert!(
+            !registry
+                .finish(
+                    &brief,
+                    &outcome,
+                    true,
+                    Some(b"output"),
+                    Some("operation-02")
+                )
+                .unwrap()
+        );
+        assert!(registry.unreported_source_briefs().unwrap().is_empty());
+        assert!(
+            registry
+                .finish(
+                    &brief,
+                    &outcome,
+                    true,
+                    Some(b"output"),
+                    Some("operation-01")
+                )
+                .unwrap()
+        );
+        assert!(registry.lease(&brief.key()).unwrap().is_none());
+        assert!(registry.read_claimed(&brief.key()).unwrap().is_none());
+        assert!(registry.list_new().unwrap().is_empty());
+        let finished = store.handle().unreported_source_briefs().unwrap();
+        assert_eq!(finished.len(), 1);
+        assert_eq!((finished[0].ok, &finished[0].outcome), (true, &outcome));
+        assert_eq!(
+            registry
+                .finish(&brief, &serde_json::json!("done"), true, None, None)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    fn expired_leases_requeue_or_fail_at_the_attempt_limit(store: &dyn Store) {
+        for (id, max_attempts, expected) in [
+            ("o/r#requeue", 3, LeaseRecovery::Requeued),
+            ("o/r#fail", 1, LeaseRecovery::Failed),
+        ] {
+            let registry = store.handle();
+            registry
+                .ingest_source_item("G", "github", &source_item(id), "station-a")
+                .unwrap();
+            let lease = registry
+                .claim_with_lease(None, "operation-01", DEFAULT_LEASE, BTreeMap::new())
+                .unwrap()
+                .unwrap();
+            let key = lease.key().to_owned();
+            assert_eq!(
+                registry
+                    .recover(&lease, max_attempts, "operation-02")
+                    .unwrap(),
+                None
+            );
+
+            let lapsed = lapse(registry.as_ref(), &key, "operation-01");
+            let expired = registry.expired().unwrap();
+            assert_eq!(expired.len(), 1);
+            assert_eq!(expired[0], lapsed);
+            assert_eq!(
+                store
+                    .handle()
+                    .recover(&expired[0], max_attempts, "operation-02")
+                    .unwrap(),
+                Some(expected)
+            );
+            assert_eq!(
+                registry
+                    .recover(&expired[0], max_attempts, "operation-02")
+                    .unwrap(),
+                None,
+                "a lease is recovered once"
+            );
+            assert!(registry.lease(&key).unwrap().is_none());
+            match expected {
+                LeaseRecovery::Requeued => {
+                    assert_eq!(registry.list_new().unwrap()[0].key(), key);
+                    let again = registry
+                        .claim_with_lease(None, "operation-02", DEFAULT_LEASE, BTreeMap::new())
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(again.attempt(), 2);
+                    registry
+                        .finish(
+                            &registry.read_claimed(&key).unwrap().unwrap(),
+                            &serde_json::json!({"state": "done"}),
+                            true,
+                            None,
+                            Some("operation-02"),
+                        )
+                        .unwrap();
+                }
+                LeaseRecovery::Failed => {
+                    assert!(registry.list_new().unwrap().is_empty());
+                    let failed = registry
+                        .unreported_source_briefs()
+                        .unwrap()
+                        .into_iter()
+                        .find(|finished| finished.brief.key() == key)
+                        .unwrap();
+                    assert!(!failed.ok);
+                    assert_eq!(failed.outcome["state"], "lost");
+                    assert_eq!(failed.outcome["recovered_by"], "operation-02");
+                }
+            }
+        }
+    }
+
+    fn an_expired_lease_is_handed_over_once_with_its_claim_and_attempt(store: &dyn Store) {
+        let registry = store.handle();
+        registry.submit_brief(&brief("hand-over")).unwrap();
+        let meta = BTreeMap::from([("mission_id".to_owned(), serde_json::json!("m-1"))]);
+        let lease = registry
+            .claim_with_lease(None, "station-a", DEFAULT_LEASE, meta)
+            .unwrap()
+            .unwrap();
+        let extra = BTreeMap::from([("adopt".to_owned(), serde_json::json!("s-1"))]);
+
+        // A live lease stays with its holder.
+        assert_eq!(
+            registry
+                .hand_over(&lease, "station-b", DEFAULT_LEASE, extra.clone())
+                .unwrap(),
+            None
+        );
+
+        // The holder's last renewal runs out.
+        let expired = lapse(registry.as_ref(), lease.key(), "station-a");
+        let handed = store
+            .handle()
+            .hand_over(&expired, "station-b", DEFAULT_LEASE, extra.clone())
+            .unwrap()
+            .unwrap();
+        assert_eq!(handed.station(), "station-b");
+        assert_eq!(handed.attempt(), lease.attempt());
+        assert_eq!(handed.meta()["mission_id"], "m-1");
+        assert_eq!(handed.meta()["adopt"], "s-1");
+        let stored = registry.lease(lease.key()).unwrap().unwrap();
+        assert_eq!(
+            (stored.station(), stored.attempt(), stored.meta()),
+            (handed.station(), handed.attempt(), handed.meta())
+        );
+        assert!(registry.read_claimed(lease.key()).unwrap().is_some());
+
+        // The old view of the lease no longer matches, so it is not handed over twice.
+        assert_eq!(
+            registry
+                .hand_over(&expired, "station-c", DEFAULT_LEASE, extra)
+                .unwrap(),
+            None
+        );
+        assert!(
+            registry
+                .renew(lease.key(), "station-b", DEFAULT_LEASE)
+                .unwrap()
+        );
+        assert!(
+            !registry
+                .renew(lease.key(), "station-a", DEFAULT_LEASE)
+                .unwrap()
+        );
+    }
+
+    fn leased_claim_is_exclusive_and_registry_keys_are_checked(store: &dyn Store) {
+        store.handle().submit_brief(&brief("brief-1")).unwrap();
+        let first = store.handle();
+        let second = store.handle();
+        let first_thread = std::thread::spawn(move || {
+            first.claim_with_lease(None, "one", DEFAULT_LEASE, BTreeMap::new())
+        });
+        let second_thread = std::thread::spawn(move || {
+            second.claim_with_lease(None, "two", DEFAULT_LEASE, BTreeMap::new())
+        });
+        let claims = [
+            first_thread.join().unwrap().unwrap(),
+            second_thread.join().unwrap().unwrap(),
+        ];
+        assert_eq!(claims.iter().filter(|claim| claim.is_some()).count(), 1);
+        let registry = store.handle();
+        assert!(registry.lease("../outside").is_err());
+        assert!(registry.read_claimed("../outside").is_err());
+        assert_eq!(
+            registry
+                .claim_with_lease(None, " ", DEFAULT_LEASE, BTreeMap::new())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    fn cable_store_is_idempotent_and_rejects_conflicting_retries(store: &dyn Store) {
+        let registry = store.handle();
+        let cable = test_cable("cable-1", "send-1", "Review this", "session-8");
+
+        assert_eq!(registry.submit_cable(&cable).unwrap(), cable);
+        let retry = test_cable("cable-retry", "send-1", "Review this", "session-8");
+        assert_eq!(store.handle().submit_cable(&retry).unwrap(), cable);
+        assert_eq!(
+            registry.find_cable("007", "send-1").unwrap(),
+            Some(cable.clone())
+        );
+        assert_eq!(registry.get_cable("cable-1").unwrap(), Some(cable));
+        assert_eq!(registry.get_cable("cable-retry").unwrap(), None);
+
+        let conflict = test_cable("cable-2", "send-1", "Different body", "session-8");
+        assert_eq!(
+            registry.submit_cable(&conflict).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+
+        // One timeline entry for the one Cable sent: its metadata, never its body.
+        let operation = registry
+            .get_cable("cable-1")
+            .unwrap()
+            .unwrap()
+            .sender_operation()
+            .to_owned();
+        let events = registry.timeline_events(&operation).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            (events[0].kind.as_str(), events[0].action.as_str()),
+            ("cable", "sent")
+        );
+        assert_eq!(events[0].actor.as_deref(), Some("007"));
+        assert_eq!(events[0].detail["cable"], "cable-1");
+        assert_eq!(events[0].detail["recipients"], "1");
+        assert!(
+            !serde_json::to_string(&events)
+                .unwrap()
+                .contains("Review this")
+        );
+    }
+
+    fn cable_inbox_and_delivery_updates_follow_session_and_expiry(store: &dyn Store) {
+        let registry = store.handle();
+        let cable = test_cable("cable-1", "send-1", "Review this", "session-8");
+        registry.submit_cable(&cable).unwrap();
+
+        assert!(
+            registry
+                .cable_inbox("008", Some("session-other"), 10, Some(1_700_000_100.0))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            registry
+                .cable_inbox("008", Some("session-8"), 10, Some(1_700_000_100.0))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let held = registry
+            .update_cable_delivery(
+                "cable-1",
+                "008",
+                Some("session-8"),
+                CableState::Held,
+                None,
+                Some(1_700_000_100.0),
+            )
+            .unwrap()
+            .unwrap();
+        let listed = store
+            .handle()
+            .held_cables(10, Some(1_700_000_100.0))
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0], held);
+        assert!(
+            registry
+                .held_cables(10, Some(1_700_001_000.0))
+                .unwrap()
+                .is_empty()
+        );
+
+        let delivered = registry
+            .update_cable_delivery(
+                "cable-1",
+                "008",
+                Some("session-8"),
+                CableState::Delivered,
+                None,
+                Some(1_700_000_100.0),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivered.recipients()[0].state(), CableState::Delivered);
+        assert!(
+            registry
+                .held_cables(10, Some(1_700_000_100.0))
+                .unwrap()
+                .is_empty()
+        );
+        let expired = registry
+            .update_cable_delivery(
+                "cable-1",
+                "008",
+                Some("session-8"),
+                CableState::Acked,
+                None,
+                Some(1_700_001_000.0),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(expired.recipients()[0].state(), CableState::Expired);
+        assert!(
+            registry
+                .cable_inbox("008", Some("session-8"), 10, Some(1_700_000_100.0))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            registry
+                .update_cable_delivery("cable-9", "008", None, CableState::Acked, None, None)
+                .unwrap(),
+            None
+        );
+    }
+
+    fn cable_quotas_are_atomic_and_shared(store: &dyn Store) {
+        let registry = store.handle();
+        let buckets = [("sender:007", 1.0, 2), ("scope:operation:G", 1.0, 1)];
+
+        assert!(registry.take_quotas(&buckets, 100.0).unwrap());
+        assert!(!registry.take_quotas(&buckets, 100.0).unwrap());
+        assert!(
+            registry
+                .take_quotas(&[("sender:007", 1.0, 2)], 100.0)
+                .unwrap()
+        );
+        assert!(
+            !registry
+                .take_quotas(&[("sender:007", 1.0, 2)], 100.0)
+                .unwrap()
+        );
+        assert!(registry.take_quotas(&buckets, 101.0).unwrap());
+        assert!(!store.handle().take_quotas(&buckets, 101.0).unwrap());
+        assert_eq!(
+            registry
+                .take_quotas(&[("a", 1.0, 1), ("a", 1.0, 1)], 1.0)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    fn access_tokens_are_shared_by_registries_and_revocation_is_immediate(store: &dyn Store) {
+        let issuer = store.handle();
+        let verifier = store.handle();
+        let record = access_token(unix_time().unwrap());
+        issuer.store_access_token(&record).unwrap();
+        assert_eq!(
+            issuer.store_access_token(&record).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+
+        let shared = verifier
+            .find_access_token(record.digest())
+            .unwrap()
+            .unwrap();
+        assert_eq!(shared.token_id(), record.token_id());
+        assert_eq!(shared.digest(), record.digest());
+        assert_eq!(shared.person_id(), record.person_id());
+        assert!((shared.issued_at() - record.issued_at()).abs() < 1e-6);
+        assert!((shared.expires_at() - record.expires_at()).abs() < 1e-6);
+        assert_eq!(shared.revoked_at(), record.revoked_at());
+        assert!(issuer.revoke_access_token(record.token_id()).unwrap());
+        assert!(
+            verifier
+                .find_access_token(record.digest())
+                .unwrap()
+                .is_none()
+        );
+        assert!(!verifier.revoke_access_token(record.token_id()).unwrap());
+        assert!(verifier.revoke_access_token("not-a-uuid").is_err());
+    }
+
+    fn an_access_token_is_extended_never_shortened(store: &dyn Store) {
+        let registry = store.handle();
+        let verifier = store.handle();
+        let now = unix_time().unwrap();
+        let record = access_token(now);
+        let id = record.token_id();
+        let digest = record.digest();
+        let first = record.expires_at();
+        assert!(
+            registry
+                .extend_access_token(id, first + 60.0)
+                .unwrap()
+                .is_none()
+        );
+        registry.store_access_token(&record).unwrap();
+
+        let later = first + 3_600.0;
+        let extended = registry.extend_access_token(id, later).unwrap().unwrap();
+        assert!((extended.expires_at() - later).abs() < 1e-6);
+        assert_eq!(extended.digest(), digest);
+        assert!((extended.issued_at() - record.issued_at()).abs() < 1e-6);
+        let found = verifier.find_access_token(digest).unwrap().unwrap();
+        assert!(
+            (found.expires_at() - later).abs() < 1e-6,
+            "every handle sees it"
+        );
+
+        let earlier = registry.extend_access_token(id, first).unwrap().unwrap();
+        assert!((earlier.expires_at() - later).abs() < 1e-6, "never earlier");
+        let found = verifier.find_access_token(digest).unwrap().unwrap();
+        assert!(
+            (found.expires_at() - later).abs() < 1e-6,
+            "nothing was written"
+        );
+
+        assert!(registry.extend_access_token("not-a-uuid", later).is_err());
+        assert!(registry.extend_access_token(id, f64::INFINITY).is_err());
+
+        assert!(registry.revoke_access_token(id).unwrap());
+        assert!(
+            registry
+                .extend_access_token(id, later + 60.0)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            verifier.find_access_token(digest).unwrap().is_none(),
+            "a revoked one stays revoked"
+        );
+
+        // One past its time stays over, however late the new time.
+        let digest = Sha256::digest(b"another token")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let over = crate::AccessTokenRecord::try_new(
+            "d1d9a2be-52b3-4a58-b3b5-5a9a1f7e8c10",
+            digest,
+            "person-007",
+            now - 7_200.0,
+            now - 3_600.0,
+            None,
+        )
+        .unwrap();
+        registry.store_access_token(&over).unwrap();
+        assert!(
+            registry
+                .extend_access_token(over.token_id(), later)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    fn a_session_cookie_is_no_bearer_and_revoking_ends_its_whole_sign_in(store: &dyn Store) {
+        let registry = store.handle();
+        let verifier = store.handle();
+        let now = unix_time().unwrap();
+        let record = |id: &str, secret: &str| {
+            let digest = Sha256::digest(secret.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            crate::AccessTokenRecord::try_new(id, digest, "person-007", now, now + 3_600.0, None)
+                .unwrap()
+        };
+        let sign_in = "a1111111-1111-4111-8111-111111111111";
+        let cookie = record(sign_in, "cookie").into_session_cookie();
+        let first = record("a2222222-2222-4222-8222-222222222222", "first")
+            .in_sign_in(sign_in)
+            .unwrap();
+        let second = record("a3333333-3333-4333-8333-333333333333", "second")
+            .in_sign_in(sign_in)
+            .unwrap();
+        let other_sign_in = "b1111111-1111-4111-8111-111111111111";
+        let other_cookie = record(other_sign_in, "other cookie").into_session_cookie();
+        let other = record("b2222222-2222-4222-8222-222222222222", "other")
+            .in_sign_in(other_sign_in)
+            .unwrap();
+        let plain = record("c2222222-2222-4222-8222-222222222222", "plain");
+        for record in [&cookie, &first, &second, &other_cookie, &other, &plain] {
+            registry.store_access_token(record).unwrap();
+        }
+
+        assert!(
+            verifier
+                .find_access_token(cookie.digest())
+                .unwrap()
+                .is_none(),
+            "a cookie is no bearer"
+        );
+        let found = verifier
+            .find_session_cookie(cookie.digest())
+            .unwrap()
+            .unwrap();
+        assert!(found.is_session_cookie());
+        assert!(
+            verifier
+                .find_session_cookie(first.digest())
+                .unwrap()
+                .is_none(),
+            "a bearer is no cookie"
+        );
+        let found = verifier.find_access_token(first.digest()).unwrap().unwrap();
+        assert_eq!(found.sign_in(), Some(sign_in));
+        // A sign-in is found by its ID, a cookie's or a token's, while it stands.
+        for id in [sign_in, first.token_id(), plain.token_id()] {
+            assert_eq!(verifier.login_by_id(id).unwrap().unwrap().token_id(), id);
+        }
+        assert!(
+            verifier
+                .login_by_id("d1111111-1111-4111-8111-111111111111")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            registry
+                .extend_access_token(sign_in, now + 7_200.0)
+                .unwrap()
+                .is_none(),
+            "a cookie's end does not move"
+        );
+        let renewed = registry
+            .extend_access_token(first.token_id(), now + 7_200.0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(renewed.sign_in(), Some(sign_in), "renewing keeps it");
+
+        assert!(registry.revoke_access_token(first.token_id()).unwrap());
+        for gone in [&first, &second] {
+            assert!(
+                verifier.find_access_token(gone.digest()).unwrap().is_none(),
+                "the whole sign-in ends"
+            );
+        }
+        assert!(
+            verifier
+                .find_session_cookie(cookie.digest())
+                .unwrap()
+                .is_none(),
+            "and its cookie"
+        );
+        for id in [sign_in, first.token_id(), second.token_id()] {
+            assert!(verifier.login_by_id(id).unwrap().is_none(), "{id} ended");
+        }
+        let late = record("a4444444-4444-4444-8444-444444444444", "late")
+            .in_sign_in(sign_in)
+            .unwrap();
+        registry.store_access_token(&late).unwrap();
+        assert!(
+            verifier.find_access_token(late.digest()).unwrap().is_none(),
+            "a token issued as it ended does not outlive it"
+        );
+        assert!(
+            verifier
+                .find_access_token(other.digest())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            verifier
+                .find_session_cookie(other_cookie.digest())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            verifier
+                .find_access_token(plain.digest())
+                .unwrap()
+                .is_some()
+        );
+
+        // The cookie revoked by its own ID ends the tokens too.
+        assert!(registry.revoke_access_token(other_sign_in).unwrap());
+        assert!(
+            verifier
+                .find_access_token(other.digest())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // The file Registry's own layout: what other tools find on disk.
+
+    #[test]
+    fn station_check_ins_follow_the_registry_record_contract() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = FileRegistry::open(root.path());
+        let mut info = BTreeMap::new();
+        info.insert("station_count".to_owned(), serde_json::json!(3));
+        info.insert("station".to_owned(), serde_json::json!("forged"));
+
+        registry.check_in("Stätion/one", info).unwrap();
+
+        let path = root.path().join("stations/Stätion_one.json");
+        let stored: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(stored["station"], "Stätion/one");
+        assert_eq!(stored["station_count"], 3);
+        assert!(stored["seen"].as_f64().unwrap() > 0.0);
+        assert!(stored.get("info").is_none());
+    }
+
+    #[test]
+    fn site_registry_records_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<StationRecord>();
+        assert_send_sync::<HeadquartersLease>();
+    }
+
+    #[test]
+    fn site_listing_skips_stale_and_malformed_records() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("stations");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("stale.json"),
+            r#"{"station":"stale","seen":0}"#,
+        )
+        .unwrap();
+        fs::write(directory.join("malformed.json"), b"not json").unwrap();
+        let registry = FileRegistry::open(root.path());
+        registry.check_in("fresh", BTreeMap::new()).unwrap();
+
+        let stations = registry.stations(DEFAULT_LEASE).unwrap();
+
+        assert_eq!(stations.len(), 1);
+        assert_eq!(stations[0].station(), "fresh");
+    }
+
+    #[test]
+    fn an_expired_headquarters_lease_is_filed_before_the_next_election() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("headquarters");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("lease.json"),
+            r#"{"station":"old-station","expires":0,"term":1}"#,
+        )
+        .unwrap();
+        let registry = FileRegistry::open(root.path());
+
+        assert!(registry.elect("new/station", DEFAULT_LEASE).unwrap());
+
+        let lapsed: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.join("lease.lapsed.new_station")).unwrap())
+                .unwrap();
+        assert_eq!(lapsed["station"], "old-station");
+        assert_eq!(
+            registry.headquarters().unwrap().unwrap().station(),
+            "new/station"
+        );
+    }
+
+    #[test]
+    fn brief_key_and_prompt_follow_the_registry_contract() {
+        let brief: Brief = serde_json::from_str(
+            r#"{"title":"  Do it  ","body":"  carefully ","id":"A / 42","source":"help desk","url":"https://example.test"}"#,
+        )
+        .unwrap();
+        assert_eq!(brief.key(), "help_desk--A_42");
+        assert_eq!(
+            brief.prompt(),
+            "Do it\n\ncarefully\n\nSource: https://example.test"
+        );
+    }
+
+    #[test]
+    fn lists_valid_new_briefs_in_registry_order_and_skips_bad_files() {
+        let root = tempfile::tempdir().unwrap();
+        let queue = root.path().join("new");
+        fs::create_dir(&queue).unwrap();
+        fs::write(queue.join("invalid.json"), b"not json").unwrap();
+        let low = r#"{"title":"low","id":"low","priority":2,"created":"2026-01-01"}"#;
+        let high_late = r#"{"title":"high late","id":"late","priority":9,"created":"2026-02-01"}"#;
+        let high_early =
+            r#"{"title":"high early","id":"early","priority":9,"created":"2026-01-01"}"#;
+        fs::write(queue.join("a.json"), low).unwrap();
+        fs::write(queue.join("b.json"), high_late).unwrap();
+        fs::write(queue.join("c.json"), high_early).unwrap();
+        let briefs = FileRegistry::open(root.path()).list_new().unwrap();
+        assert_eq!(
+            briefs
+                .iter()
+                .map(|brief| brief.title.as_str())
+                .collect::<Vec<_>>(),
+            ["high early", "high late", "low"]
+        );
+    }
+
+    #[test]
+    fn leased_claim_follows_the_registry_layout() {
+        let root = tempfile::tempdir().unwrap();
+        let queue = root.path().join("new");
+        fs::create_dir(&queue).unwrap();
+        fs::write(
+            queue.join("manual--brief-1.json"),
+            r#"{"title":"Inspect","id":"brief-1"}"#,
+        )
+        .unwrap();
+        let registry = FileRegistry::open(root.path());
+        let mut meta = BTreeMap::new();
+        meta.insert("operation".to_owned(), serde_json::json!("operation-01"));
+
+        registry
+            .claim_with_lease(None, "operation-01", DEFAULT_LEASE, meta)
+            .unwrap()
+            .unwrap();
+        assert!(!queue.join("manual--brief-1.json").exists());
+        assert!(root.path().join("claimed/manual--brief-1.json").is_file());
+        assert_eq!(
+            fs::read_to_string(root.path().join("attempts/manual--brief-1.json")).unwrap(),
+            "1"
+        );
+        let stored: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.path().join("leases/manual--brief-1.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored["station"], "operation-01");
+        assert_eq!(stored["attempt"], 1);
+        assert_eq!(stored["meta"]["operation"], "operation-01");
+        assert!(stored.get("key").is_none());
+    }
+
+    #[test]
+    fn finish_files_the_outcome_and_transcript_beside_the_brief() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = FileRegistry::open(root.path());
+        registry.submit_brief(&brief("brief-1")).unwrap();
+        let claimed = registry.claim_new(None).unwrap().unwrap();
+        let outcome = serde_json::json!({"state": "done", "mission_id": "mission-1"});
+        assert!(
+            registry
+                .finish(&claimed, &outcome, true, Some(b"output"), None)
+                .unwrap()
+        );
+        let target = root.path().join("done/manual--brief-1.json");
+        assert!(target.is_file());
+        assert_eq!(fs::read(target.with_extension("log")).unwrap(), b"output");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &fs::read(target.with_file_name("manual--brief-1.outcome.json")).unwrap()
+            )
+            .unwrap(),
+            outcome
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_fields_and_newer_versions() {
+        assert!(serde_json::from_str::<Brief>(r#"{"title":"x","typo":1}"#).is_err());
+        let brief: Brief = serde_json::from_str(r#"{"title":"x","version":2}"#).unwrap();
+        assert_eq!(
+            brief.validate().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn cable_quotas_share_the_registry_format() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = FileRegistry::open(root.path());
+        let buckets = [("sender:007", 1.0, 2), ("scope:operation:G", 1.0, 1)];
+        assert!(registry.take_quotas(&buckets, 100.0).unwrap());
+
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.path().join("cable-quotas.json")).unwrap())
+                .unwrap();
+        assert!(saved.get("sender:007").is_none());
+        assert!(
+            saved
+                .as_object()
+                .unwrap()
+                .keys()
+                .all(|key| key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        );
+        assert!(
+            saved
+                .get("917f1172ca6099e51a0029f95620987bfda15f5a2b08ea43cd6e6e4cacf69e57")
+                .is_some()
+        );
+        assert!(
+            saved
+                .get("096648f6cda52c6919328146fde0d5e058d725a4d88f32c9e6a5249ccb503e3f")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn access_tokens_are_stored_by_digest() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = FileRegistry::open(root.path());
+        let record = access_token(unix_time().unwrap());
+        registry.store_access_token(&record).unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                root.path()
+                    .join(format!("access-tokens/{}.json", record.token_id())),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored["digest"], record.digest());
+        assert_eq!(
+            fs::read_to_string(
+                root.path()
+                    .join(format!("access-token-digests/{}.txt", record.digest()))
+            )
+            .unwrap()
+            .trim(),
+            record.token_id()
+        );
+    }
+}

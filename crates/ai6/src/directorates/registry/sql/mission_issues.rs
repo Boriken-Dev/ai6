@@ -1,0 +1,488 @@
+//! Linked issues and the outbox in SQL: the shared logic of the file Registry, run in one
+//! write transaction on two tables.
+
+use std::io;
+
+use super::db::Tx;
+use super::{SqlRegistry, from_json, to_json};
+use crate::directorates::registry::mission_issues::{
+    IssueLink, IssueProposal, IssueQuestion, IssueReply, IssueSnapshot, IssueTables, LinkState,
+    MissionIssueStore, OutboxEntry, OutboxSettle, OutboxState, QuestionState, ReplyState, adopt_in,
+    ask_in, begin_in, decide_proposal_in, due_in, link_issue_in, mark_reply_in, mark_told_in,
+    propose_in, queue_in, record_created_in, resolve_held_in, set_snapshot_in, set_status_in,
+    settle_in, settle_question_in, store_reply_in, unlink_in,
+};
+
+/// The two tables, inside one transaction at `revision`.
+struct SqlTables<'a, 'b> {
+    tx: &'a mut Tx<'b>,
+    revision: i64,
+}
+
+impl IssueTables for SqlTables<'_, '_> {
+    fn links(&mut self, mission: &str) -> io::Result<Vec<IssueLink>> {
+        self.tx
+            .query_opt(
+                "SELECT links FROM ai6_mission_issues WHERE mission_id = $1",
+                &[mission.into()],
+            )?
+            .map(|row| from_json(&row.text(0)?, "linked issues"))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+
+    fn all_links(&mut self) -> io::Result<Vec<IssueLink>> {
+        let rows = self.tx.query("SELECT links FROM ai6_mission_issues", &[])?;
+        let mut all = Vec::new();
+        for row in rows {
+            if let Ok(links) = from_json::<Vec<IssueLink>>(&row.text(0)?, "linked issues") {
+                all.extend(links);
+            }
+        }
+        Ok(all)
+    }
+
+    fn put_links(&mut self, mission: &str, links: &[IssueLink]) -> io::Result<()> {
+        self.tx.execute(
+            "INSERT INTO ai6_mission_issues (mission_id, links, revision) VALUES ($1, $2, $3) \
+             ON CONFLICT (mission_id) DO UPDATE SET links = excluded.links, \
+             revision = excluded.revision",
+            &[
+                mission.into(),
+                to_json(&links)?.into(),
+                self.revision.into(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn outbox(&mut self) -> io::Result<Vec<OutboxEntry>> {
+        let rows = self.tx.query("SELECT record FROM ai6_issue_outbox", &[])?;
+        let mut all = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let Ok(entry) = from_json::<OutboxEntry>(&row.text(0)?, "outbox entry") {
+                all.push(entry);
+            }
+        }
+        all.sort_by(|a, b| a.at.total_cmp(&b.at).then_with(|| a.id.cmp(&b.id)));
+        Ok(all)
+    }
+
+    fn put_entry(&mut self, entry: &OutboxEntry) -> io::Result<()> {
+        let state = serde_json::to_value(entry.state)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        self.tx.execute(
+            "INSERT INTO ai6_issue_outbox (id, state, record, revision) VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (id) DO UPDATE SET state = excluded.state, record = excluded.record, \
+             revision = excluded.revision",
+            &[
+                entry.id.as_str().into(),
+                state.into(),
+                to_json(entry)?.into(),
+                self.revision.into(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn drop_entry(&mut self, id: &str) -> io::Result<()> {
+        self.tx
+            .execute("DELETE FROM ai6_issue_outbox WHERE id = $1", &[id.into()])?;
+        Ok(())
+    }
+
+    fn questions(&mut self, mission: &str) -> io::Result<Vec<IssueQuestion>> {
+        self.list("ai6_issue_questions", "questions", mission)
+    }
+
+    fn all_questions(&mut self) -> io::Result<Vec<IssueQuestion>> {
+        self.all("ai6_issue_questions", "questions")
+    }
+
+    fn put_questions(&mut self, mission: &str, questions: &[IssueQuestion]) -> io::Result<()> {
+        self.put("ai6_issue_questions", "questions", mission, questions)
+    }
+
+    fn replies(&mut self, mission: &str) -> io::Result<Vec<IssueReply>> {
+        self.list("ai6_issue_replies", "replies", mission)
+    }
+
+    fn all_replies(&mut self) -> io::Result<Vec<IssueReply>> {
+        self.all("ai6_issue_replies", "replies")
+    }
+
+    fn put_replies(&mut self, mission: &str, replies: &[IssueReply]) -> io::Result<()> {
+        self.put("ai6_issue_replies", "replies", mission, replies)
+    }
+
+    fn proposals(&mut self) -> io::Result<Vec<IssueProposal>> {
+        let rows = self
+            .tx
+            .query("SELECT record FROM ai6_issue_proposals", &[])?;
+        let mut all = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let Ok(proposal) = from_json::<IssueProposal>(&row.text(0)?, "issue proposal") {
+                all.push(proposal);
+            }
+        }
+        all.sort_by(|a, b| a.at.total_cmp(&b.at).then_with(|| a.id.cmp(&b.id)));
+        Ok(all)
+    }
+
+    fn put_proposal(&mut self, proposal: &IssueProposal) -> io::Result<()> {
+        let state = serde_json::to_value(proposal.state)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        self.tx.execute(
+            "INSERT INTO ai6_issue_proposals (id, mission_id, state, record, revision) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO UPDATE SET state = excluded.state, \
+             record = excluded.record, revision = excluded.revision",
+            &[
+                proposal.id.as_str().into(),
+                proposal.mission_id.as_str().into(),
+                state.into(),
+                to_json(proposal)?.into(),
+                self.revision.into(),
+            ],
+        )?;
+        Ok(())
+    }
+}
+
+impl SqlTables<'_, '_> {
+    fn list<T: serde::de::DeserializeOwned>(
+        &mut self,
+        table: &str,
+        column: &str,
+        mission: &str,
+    ) -> io::Result<Vec<T>> {
+        self.tx
+            .query_opt(
+                &format!("SELECT {column} FROM {table} WHERE mission_id = $1"),
+                &[mission.into()],
+            )?
+            .map(|row| from_json(&row.text(0)?, "issue records"))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+
+    fn all<T: serde::de::DeserializeOwned>(
+        &mut self,
+        table: &str,
+        column: &str,
+    ) -> io::Result<Vec<T>> {
+        let rows = self
+            .tx
+            .query(&format!("SELECT {column} FROM {table}"), &[])?;
+        let mut all = Vec::new();
+        for row in rows {
+            if let Ok(list) = from_json::<Vec<T>>(&row.text(0)?, "issue records") {
+                all.extend(list);
+            }
+        }
+        Ok(all)
+    }
+
+    fn put<T: serde::Serialize>(
+        &mut self,
+        table: &str,
+        column: &str,
+        mission: &str,
+        list: &[T],
+    ) -> io::Result<()> {
+        self.tx.execute(
+            &format!(
+                "INSERT INTO {table} (mission_id, {column}, revision) VALUES ($1, $2, $3) \
+                 ON CONFLICT (mission_id) DO UPDATE SET {column} = excluded.{column}, \
+                 revision = excluded.revision"
+            ),
+            &[mission.into(), to_json(&list)?.into(), self.revision.into()],
+        )?;
+        Ok(())
+    }
+}
+
+impl MissionIssueStore for SqlRegistry {
+    fn link_issue(&self, link: &IssueLink) -> io::Result<IssueLink> {
+        self.write(|tx, revision| {
+            link_issue_in(&mut SqlTables { tx, revision }, link, &self.limits.issues)
+        })
+    }
+
+    fn issue_links(&self, mission_id: &str) -> io::Result<Vec<IssueLink>> {
+        self.read(|tx| SqlTables { tx, revision: 0 }.links(mission_id))
+    }
+
+    fn active_issue_links(&self) -> io::Result<Vec<IssueLink>> {
+        Ok(self
+            .read(|tx| SqlTables { tx, revision: 0 }.all_links())?
+            .into_iter()
+            .filter(|link| link.state == LinkState::Active)
+            .collect())
+    }
+
+    fn unlink_issue(&self, mission_id: &str, tracker: &str, item: &str) -> io::Result<bool> {
+        self.write(|tx, revision| {
+            unlink_in(&mut SqlTables { tx, revision }, mission_id, tracker, item)
+        })
+    }
+
+    fn set_issue_status(
+        &self,
+        mission_id: &str,
+        tracker: &str,
+        item: &str,
+        comment: Option<&str>,
+        phase: Option<&str>,
+    ) -> io::Result<()> {
+        self.write(|tx, revision| {
+            set_status_in(
+                &mut SqlTables { tx, revision },
+                mission_id,
+                tracker,
+                item,
+                comment,
+                phase,
+            )
+        })
+    }
+
+    fn set_issue_snapshot(
+        &self,
+        mission_id: &str,
+        tracker: &str,
+        item: &str,
+        url: Option<&str>,
+        snapshot: &IssueSnapshot,
+    ) -> io::Result<()> {
+        self.write(|tx, revision| {
+            set_snapshot_in(
+                &mut SqlTables { tx, revision },
+                mission_id,
+                tracker,
+                item,
+                url,
+                snapshot,
+                &self.limits.issues,
+            )
+        })
+    }
+
+    fn queue_outbox(&self, entry: &OutboxEntry) -> io::Result<OutboxEntry> {
+        self.write(|tx, revision| {
+            queue_in(&mut SqlTables { tx, revision }, entry, &self.limits.issues)
+        })
+    }
+
+    fn outbox_entry(&self, id: &str) -> io::Result<Option<OutboxEntry>> {
+        self.read(|tx| {
+            tx.query_opt(
+                "SELECT record FROM ai6_issue_outbox WHERE id = $1",
+                &[id.into()],
+            )?
+            .map(|row| from_json(&row.text(0)?, "outbox entry"))
+            .transpose()
+        })
+    }
+
+    fn outbox_entries(&self, mission_id: Option<&str>) -> io::Result<Vec<OutboxEntry>> {
+        Ok(self
+            .read(|tx| SqlTables { tx, revision: 0 }.outbox())?
+            .into_iter()
+            .filter(|entry| mission_id.is_none_or(|mission| entry.mission_id == mission))
+            .collect())
+    }
+
+    fn due_outbox(&self, now: f64, limit: usize) -> io::Result<Vec<OutboxEntry>> {
+        self.read(|tx| due_in(&mut SqlTables { tx, revision: 0 }, now, limit))
+    }
+
+    fn begin_outbox_send(&self, id: &str, term: u64, now: f64) -> io::Result<Option<OutboxEntry>> {
+        self.write(|tx, revision| begin_in(&mut SqlTables { tx, revision }, id, term, now))
+    }
+
+    fn sending_outbox(&self) -> io::Result<Vec<OutboxEntry>> {
+        Ok(self
+            .read(|tx| SqlTables { tx, revision: 0 }.outbox())?
+            .into_iter()
+            .filter(|entry| entry.state == OutboxState::Sending)
+            .collect())
+    }
+
+    fn adopt_outbox_send(&self, id: &str, term: u64) -> io::Result<Option<OutboxEntry>> {
+        self.write(|tx, revision| adopt_in(&mut SqlTables { tx, revision }, id, term))
+    }
+
+    fn settle_outbox(&self, id: &str, term: u64, settle: OutboxSettle) -> io::Result<OutboxEntry> {
+        self.write(|tx, revision| settle_in(&mut SqlTables { tx, revision }, id, term, settle))
+    }
+
+    fn propose_issues(&self, proposal: &IssueProposal) -> io::Result<IssueProposal> {
+        self.write(|tx, revision| {
+            propose_in(
+                &mut SqlTables { tx, revision },
+                proposal,
+                &self.limits.issues,
+            )
+        })
+    }
+
+    fn issue_proposal(&self, id: &str) -> io::Result<Option<IssueProposal>> {
+        self.read(|tx| {
+            tx.query_opt(
+                "SELECT record FROM ai6_issue_proposals WHERE id = $1",
+                &[id.into()],
+            )?
+            .map(|row| from_json(&row.text(0)?, "issue proposal"))
+            .transpose()
+        })
+    }
+
+    fn issue_proposals(&self, mission_id: Option<&str>) -> io::Result<Vec<IssueProposal>> {
+        Ok(self
+            .read(|tx| SqlTables { tx, revision: 0 }.proposals())?
+            .into_iter()
+            .filter(|proposal| mission_id.is_none_or(|mission| proposal.mission_id == mission))
+            .collect())
+    }
+
+    fn decide_issue_proposal(
+        &self,
+        id: &str,
+        approved: bool,
+        by: &str,
+        mark_ready: bool,
+    ) -> io::Result<Option<IssueProposal>> {
+        self.write(|tx, revision| {
+            decide_proposal_in(
+                &mut SqlTables { tx, revision },
+                id,
+                approved,
+                by,
+                mark_ready,
+            )
+        })
+    }
+
+    fn mark_proposal_told(&self, id: &str) -> io::Result<bool> {
+        self.write(|tx, revision| mark_told_in(&mut SqlTables { tx, revision }, id))
+    }
+
+    fn record_created_issues(
+        &self,
+        id: &str,
+        items: &[String],
+        failures: &[String],
+    ) -> io::Result<IssueProposal> {
+        self.write(|tx, revision| {
+            record_created_in(&mut SqlTables { tx, revision }, id, items, failures)
+        })
+    }
+
+    fn ask_issue_question(&self, question: &IssueQuestion) -> io::Result<IssueQuestion> {
+        self.write(|tx, revision| ask_in(&mut SqlTables { tx, revision }, question))
+    }
+
+    fn issue_questions(&self, mission_id: &str) -> io::Result<Vec<IssueQuestion>> {
+        self.read(|tx| SqlTables { tx, revision: 0 }.questions(mission_id))
+    }
+
+    fn open_issue_questions(&self) -> io::Result<Vec<IssueQuestion>> {
+        Ok(self
+            .read(|tx| SqlTables { tx, revision: 0 }.all_questions())?
+            .into_iter()
+            .filter(|question| question.state == QuestionState::Open)
+            .collect())
+    }
+
+    fn settle_issue_question(
+        &self,
+        mission_id: &str,
+        id: &str,
+        state: QuestionState,
+    ) -> io::Result<bool> {
+        self.write(|tx, revision| {
+            settle_question_in(&mut SqlTables { tx, revision }, mission_id, id, state)
+        })
+    }
+
+    fn store_issue_reply(&self, reply: &IssueReply) -> io::Result<bool> {
+        self.write(|tx, revision| {
+            store_reply_in(&mut SqlTables { tx, revision }, reply, &self.limits.issues)
+        })
+    }
+
+    fn issue_replies(&self, mission_id: &str) -> io::Result<Vec<IssueReply>> {
+        self.read(|tx| SqlTables { tx, revision: 0 }.replies(mission_id))
+    }
+
+    fn pending_issue_replies(&self) -> io::Result<Vec<IssueReply>> {
+        Ok(self
+            .read(|tx| SqlTables { tx, revision: 0 }.all_replies())?
+            .into_iter()
+            .filter(|reply| reply.state == ReplyState::Pending)
+            .collect())
+    }
+
+    fn mark_issue_reply(
+        &self,
+        mission_id: &str,
+        tracker: &str,
+        item: &str,
+        id: &str,
+        state: ReplyState,
+    ) -> io::Result<bool> {
+        self.write(|tx, revision| {
+            mark_reply_in(
+                &mut SqlTables { tx, revision },
+                mission_id,
+                tracker,
+                item,
+                id,
+                state,
+            )
+        })
+    }
+
+    fn issue_cursor(&self, operation: &str, tracker: &str) -> io::Result<Option<String>> {
+        self.read(|tx| {
+            tx.query_opt(
+                "SELECT cursor FROM ai6_issue_cursors WHERE operation = $1 AND tracker = $2",
+                &[operation.into(), tracker.into()],
+            )?
+            .map(|row| row.text(0))
+            .transpose()
+        })
+    }
+
+    fn set_issue_cursor(&self, operation: &str, tracker: &str, cursor: &str) -> io::Result<()> {
+        self.write(|tx, revision| {
+            tx.execute(
+                "INSERT INTO ai6_issue_cursors (operation, tracker, cursor, revision) \
+                 VALUES ($1, $2, $3, $4) ON CONFLICT (operation, tracker) DO UPDATE SET \
+                 cursor = excluded.cursor, revision = excluded.revision",
+                &[
+                    operation.into(),
+                    tracker.into(),
+                    cursor.into(),
+                    revision.into(),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn resolve_held_outbox(
+        &self,
+        id: &str,
+        approved: bool,
+        reason: &str,
+    ) -> io::Result<Option<OutboxEntry>> {
+        self.write(|tx, revision| {
+            resolve_held_in(&mut SqlTables { tx, revision }, id, approved, reason)
+        })
+    }
+}

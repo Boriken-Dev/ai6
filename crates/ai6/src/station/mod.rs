@@ -1,0 +1,38 @@
+//! The Station: the node that runs the `ai6` daemon. Directorates decide; the Station is
+//! where their decisions run — its identity, HTTP server, provider host, safe houses and
+//! publication to Universal Exports.
+
+#[cfg(feature = "daemon")]
+pub(crate) mod acp;
+#[cfg(feature = "daemon")]
+pub(crate) mod detached;
+#[cfg(feature = "daemon")]
+pub mod elevation;
+#[cfg(feature = "station-tls")]
+pub mod identity;
+#[cfg(feature = "daemon")]
+pub(crate) mod issues;
+pub mod limits;
+#[cfg(feature = "daemon")]
+pub(crate) mod overlays;
+#[cfg(feature = "daemon")]
+pub mod plugins;
+#[cfg(feature = "daemon")]
+pub(crate) mod probes;
+#[cfg(feature = "publisher")]
+pub mod publisher;
+#[cfg(feature = "daemon")]
+pub(crate) mod reach;
+#[cfg(feature = "daemon")]
+pub(crate) mod resources;
+#[cfg(feature = "daemon")]
+pub mod runner;
+pub mod safehouse;
+#[cfg(feature = "daemon")]
+pub mod server;
+#[cfg(feature = "daemon")]
+pub(crate) mod source_reads;
+#[cfg(feature = "daemon")]
+pub(crate) mod sources;
+#[cfg(feature = "daemon")]
+pub(crate) mod transports;

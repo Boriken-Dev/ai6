@@ -1,0 +1,146 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ai6",
+    "crates/ai6ctl",
+    "crates/universal-exports",
+    "crates/ai6-diptel",
+    "crates/process-tree",
+    "crates/providers/agents/*",
+    "crates/providers/safehouses/*",
+    "crates/providers/sources/*",
+    "crates/providers/terminals/*",
+    "crates/providers/theaters/*",
+    "crates/providers/transports/*",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MPL-2.0"
+repository = "https://github.com/jose-pr/ai6"
+publish = false
+
+[workspace.dependencies]
+# guatiao main, pinned until a release carries what these crates use.
+guatiao = { git = "https://github.com/Boriken-Dev/guatiao", rev = "fe9efd3797ec5e178e1f9381db0e65146d2c866e" }
+guatiao-intake = { git = "https://github.com/Boriken-Dev/guatiao", rev = "fe9efd3797ec5e178e1f9381db0e65146d2c866e", features = ["derive"] }
+guatiao-serde = { git = "https://github.com/Boriken-Dev/guatiao", rev = "fe9efd3797ec5e178e1f9381db0e65146d2c866e", default-features = false }
+# Chooses a configuration document's format and hands it to a codec over guatiao's value.
+anycfg = { git = "https://github.com/jose-pr/anycfg-rs", rev = "bf71f7097a550037972a0651e8bd35747b8dcd11" }
+# Shared access kinds, models, role authorizer and the five access providers, pinned to the
+# same guatiao revision as above so kinds and plugins agree.
+coqui-access = { git = "https://github.com/Boriken-Dev/coqui-access", rev = "af03569c43e1abc6599b95366e6df99bc88234b9" }
+coqui-roles = { git = "https://github.com/Boriken-Dev/coqui-access", rev = "af03569c43e1abc6599b95366e6df99bc88234b9" }
+# Short-lived caches in front of the Directory and Authorizer a gateway loads.
+coqui-access-kit = { git = "https://github.com/Boriken-Dev/coqui-access", rev = "af03569c43e1abc6599b95366e6df99bc88234b9", features = ["cache"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+clap = { version = "4", default-features = false, features = ["derive", "help", "std", "usage"] }
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+schemars = { version = "1", default-features = false }
+# SHA-256 keeps Cable quota keys compatible with I Branch's shared Registry format.
+sha2 = { version = "0.11.1", default-features = false }
+# Universal Exports serving TLS of its own, for client certificates on page requests.
+hyper = { version = "1.12.0", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio", "service"] }
+# Images in Moneypenny's messages travel as base64.
+base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
+# Sealed boxes (X25519 and XSalsa20-Poly1305) to each Station a login names. Pre-1.0: RustCrypto's
+# NaCl-compatible crate, the one audited (Cure53, 2022); no 1.0 exists.
+crypto_box = { version = "0.9.1", default-features = false, features = ["alloc", "getrandom", "salsa20", "seal"] }
+# The RFC 3339 times a harness's login file says it ends at; already built for rcgen.
+time = { version = "0.3", default-features = false, features = ["std", "parsing"] }
+# Keyed digests of the page cookie and of a page's view tokens.
+hmac = { version = "0.13.0", default-features = false }
+lru = { version = "0.12.5", default-features = false }
+# Compile Station cover policy patterns with Unicode-aware matching.
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode"] }
+toml = "0.9"
+# YAML configuration documents, and the front matter of a skill's SKILL.md.
+serde-saphyr = { version = "2", default-features = false, features = ["deserialize", "serialize"] }
+# The YAML event parser serde-saphyr is built on: an AOS document is read from its events, so
+# that no tag, anchor or merge key is ever applied.
+granit-parser = { version = "2", default-features = false, features = ["std"] }
+tokio = { version = "1", default-features = false, features = ["macros", "net", "rt-multi-thread"] }
+rmcp = { version = "3.7", default-features = false, features = ["macros", "server", "transport-streamable-http-server"] }
+subtle = "2.6"
+# Keyed rate limits on the Universal Exports login route.
+governor = { version = "0.10", default-features = false, features = ["std", "dashmap"] }
+uuid = { version = "1", default-features = false, features = ["std", "v4", "v7"] }
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
+# Blocking HTTP for the bounded AI6-to-Moneypenny publisher thread.
+ureq = { version = "3", default-features = false, features = ["json", "rustls"] }
+# Station-to-station mutual TLS: identity, fingerprints, a trust store with per-source caps
+# and policy profiles. Alpha releases, pinned exactly: the family is released together.
+coqui-peer = "=0.0.0-alpha.1"
+# IP networks and their matching, including IPv4-mapped addresses.
+coqui-net-acl = "=0.0.0-alpha.0"
+coqui-peer-tls = { version = "=0.0.0-alpha.1", features = ["generate", "ca", "tokio", "serde"] }
+# The configuration types coqui-peer-tls returns; shared with ureq, on the ring provider.
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+# PEM parsing and the trust-anchor check of a `ca_file`, without a crypto provider.
+rustls-pki-types = { version = "1", default-features = false, features = ["std"] }
+rustls-webpki = { version = "0.103", default-features = false }
+# The public roots as certificates: ureq takes extra roots only as a whole list of them.
+webpki-root-certs = "1"
+# Self-signed and CA-issued certificates for the Station TLS tests.
+rcgen = "0.14"
+# CPU and memory of a Station's host for placement; 0.38 is the last line within the 1.89 MSRV.
+sysinfo = { version = "0.38.4", default-features = false, features = ["system"] }
+globset = "0.4"
+# The unified diff of an assistant's memory change, shown to the person who confirms it.
+similar = { version = "2.7", default-features = false, features = ["text"] }
+# Parses the SVG Moneypenny draws in a view, for Universal Exports' allow-list.
+roxmltree = { version = "0.21.2", default-features = false, features = ["std"] }
+pulldown-cmark = { version = "0.13.5", default-features = false, features = ["html"] }
+data-encoding = { version = "2", default-features = false }
+# Validates gateway origins and encodes Session IDs as URL path segments.
+url = { version = "2", default-features = false, features = ["std"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+# The Agent Client Protocol: the wire between the Station and every agent Session. It is
+# runtime-agnostic; AI6 drives each connection on a thread of its own.
+agent-client-protocol = { version = "3.6", default-features = false }
+futures = { version = "0.3", default-features = false, features = ["std", "async-await", "executor"] }
+# The ACP client above the SDK: connect, resume and turn state, permission deciding, line transports.
+# Pinned by revision until a release.
+coqui-acp = { git = "https://github.com/Boriken-Dev/coqui-acp", rev = "b1bbd1ac316ccabcb946d713d854579434036f1e" }
+# The agent session kind a handler returns and its events, shared with every project hosting agent
+# providers. Same revision as coqui-acp, and on the same Guatiao revision as above.
+coqui-acp-provider = { git = "https://github.com/Boriken-Dev/coqui-acp", rev = "b1bbd1ac316ccabcb946d713d854579434036f1e" }
+# A2A 1.0 over a proven coqui-agentic-peer link, for Liaison. The three move together: coqui-a2a
+# names the link crate and its channel crate at these revisions.
+coqui-a2a = { git = "https://github.com/Boriken-Dev/coqui-a2a", rev = "4695046dd4718427dcc499b8fffb2064748a198b" }
+coqui-agentic-peer = { git = "https://github.com/Boriken-Dev/coqui-agentic-peer", rev = "3cd5e04cfc7bc5d7a976a9e85d8eb808662db997" }
+coqui-web-channel = { git = "https://github.com/Boriken-Dev/coqui-web-channel.git", rev = "0b5b05c9af3417f6b13edc0fc7d9c86c02a63eca", features = ["websocket"] }
+# Sends Moneypenny's tool calls through Universal Exports' own router; axum already builds it.
+tower = { version = "0.5", default-features = false, features = ["util"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio-tungstenite = "0.29"
+tempfile = "3"
+# The SQL Registry and roster: SQLite, compiled in, for one Station and for tests.
+rusqlite = { version = "0.41", default-features = false, features = ["bundled", "cache"] }
+# The SQL Registry and roster: PostgreSQL, shared by the Stations of an HA deployment. Its
+# connection runs on a runtime of its own; Registry calls wait on it from any thread.
+tokio-postgres = { version = "0.7.18", default-features = false, features = ["runtime"] }
+# TLS to PostgreSQL over the workspace's rustls, on the ring provider.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# The platform's trusted roots, for verifying a PostgreSQL server's certificate.
+rustls-native-certs = "0.8"
+# SSH transport: one pure-Rust client on every OS, with the ring crypto provider.
+russh = { version = "0.65", default-features = false, features = ["ring", "rsa"] }
+russh-sftp = "3"
+
+# A plugin scan hashes every provider library it finds. In a Linux debug build each one
+# carries its debug info, hundreds of megabytes, which unoptimized SHA-256 takes seconds
+# to hash; optimized, a scan of a whole deps directory takes seconds, not minutes.
+[profile.dev.package.sha2]
+opt-level = 3
+
+# The coqui-peer family reaches the build both from crates.io and by git revision; the git
+# revisions below are the ones coqui-agentic-peer and coqui-access name, so one copy builds.
+[patch.crates-io]
+coqui-peer = { git = "https://github.com/Boriken-Dev/coqui-peer", rev = "b6aa1f47ca956578ffcd20f936c43e8663ed059a" }
+coqui-peer-tls = { git = "https://github.com/Boriken-Dev/coqui-peer-tls", rev = "50bd7ffc6ee75e9fdf1838d5668cfdbd07f286d1" }
+coqui-net-acl = { git = "https://github.com/Boriken-Dev/coqui-net-acl", rev = "1b21d825f66ffac5599136e07021534c2c9b3ad5" }

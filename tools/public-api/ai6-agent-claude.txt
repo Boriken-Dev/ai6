@@ -1,0 +1,38 @@
+pub mod ai6_agent_claude
+pub struct ai6_agent_claude::ClaudeConfig
+pub ai6_agent_claude::ClaudeConfig::close_wait_ms: u64
+pub ai6_agent_claude::ClaudeConfig::csi_bytes: u64
+pub ai6_agent_claude::ClaudeConfig::executable: alloc::string::String
+pub ai6_agent_claude::ClaudeConfig::exit_wait_ms: u64
+pub ai6_agent_claude::ClaudeConfig::json_line_bytes: u64
+pub ai6_agent_claude::ClaudeConfig::models_wait_ms: u64
+pub ai6_agent_claude::ClaudeConfig::settings_toml: alloc::string::String
+pub ai6_agent_claude::ClaudeConfig::tail_line_bytes: u64
+pub ai6_agent_claude::ClaudeConfig::tail_lines: u64
+impl core::convert::TryFrom<ai6_agent_claude::ClaudeConfig> for ai6_agent_claude::ClaudeHandler
+pub type ai6_agent_claude::ClaudeHandler::Error = guatiao::library::kind::ProviderError
+pub fn ai6_agent_claude::ClaudeHandler::try_from(ai6_agent_claude::ClaudeConfig) -> core::result::Result<Self, Self::Error>
+impl core::default::Default for ai6_agent_claude::ClaudeConfig
+pub fn ai6_agent_claude::ClaudeConfig::default() -> Self
+pub struct ai6_agent_claude::ClaudeHandler
+impl ai6::directorates::section_00::agent::AgentHandler for ai6_agent_claude::ClaudeHandler
+pub fn ai6_agent_claude::ClaudeHandler::assistant_scripts(&self, alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> core::result::Result<core::option::Option<alloc::string::String>, guatiao::library::kind::ProviderError>
+pub fn ai6_agent_claude::ClaudeHandler::assistant_skills(&self) -> core::result::Result<core::option::Option<alloc::string::String>, guatiao::library::kind::ProviderError>
+pub fn ai6_agent_claude::ClaudeHandler::image_input(&self) -> core::result::Result<core::option::Option<alloc::string::String>, guatiao::library::kind::ProviderError>
+pub fn ai6_agent_claude::ClaudeHandler::models(&self, alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> core::result::Result<ai6::directorates::section_00::agent::ModelListing, guatiao::library::kind::ProviderError>
+pub fn ai6_agent_claude::ClaudeHandler::program(&self) -> core::result::Result<core::option::Option<alloc::string::String>, guatiao::library::kind::ProviderError>
+pub fn ai6_agent_claude::ClaudeHandler::read_only_refusal(&self) -> core::result::Result<core::option::Option<alloc::string::String>, guatiao::library::kind::ProviderError>
+pub fn ai6_agent_claude::ClaudeHandler::resume(&self, ai6::directorates::section_00::agent::AgentResume, guatiao::library::kind::object::Object<dyn ai6::directorates::q::terminal::AgentTerminal>) -> core::result::Result<guatiao::library::kind::object::Object<dyn coqui_acp_provider::kind::AgentSession>, guatiao::library::kind::ProviderError>
+pub fn ai6_agent_claude::ClaudeHandler::session_record(&self, ai6::directorates::section_00::agent::SessionRecordQuery) -> core::result::Result<core::option::Option<ai6::directorates::section_00::agent::SessionRecordFile>, guatiao::library::kind::ProviderError>
+pub fn ai6_agent_claude::ClaudeHandler::start(&self, ai6::directorates::section_00::agent::AgentStart, guatiao::library::kind::object::Object<dyn ai6::directorates::q::terminal::AgentTerminal>) -> core::result::Result<guatiao::library::kind::object::Object<dyn coqui_acp_provider::kind::AgentSession>, guatiao::library::kind::ProviderError>
+pub fn ai6_agent_claude::ClaudeHandler::stdio(&self) -> core::result::Result<ai6::directorates::q::terminal::HarnessStdio, guatiao::library::kind::ProviderError>
+pub fn ai6_agent_claude::ClaudeHandler::weakenings(&self) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, guatiao::library::kind::ProviderError>
+impl core::convert::TryFrom<ai6_agent_claude::ClaudeConfig> for ai6_agent_claude::ClaudeHandler
+pub type ai6_agent_claude::ClaudeHandler::Error = guatiao::library::kind::ProviderError
+pub fn ai6_agent_claude::ClaudeHandler::try_from(ai6_agent_claude::ClaudeConfig) -> core::result::Result<Self, Self::Error>
+impl guatiao::library::kind::parts::ProviderDecl for ai6_agent_claude::ClaudeHandler
+pub const ai6_agent_claude::ClaudeHandler::KINDS: &'static [&'static str]
+pub fn ai6_agent_claude::ClaudeHandler::provider(guatiao::library::raw::host::Host, guatiao::value::alloc::Alloc) -> core::result::Result<guatiao::library::kind::parts::ProviderParts, guatiao::value::error::ValueError>
+pub const ai6_agent_claude::RECORD_FORMAT: &str
+#[no_mangle] pub static ai6_agent_claude::guatiao_declares: [u8; 24]
+#[no_mangle] pub unsafe c fn ai6_agent_claude::guatiao_library_entry(*const guatiao::library::desc::HostInfo<'static>) -> *const guatiao::library::desc::LibraryInfo<'static>

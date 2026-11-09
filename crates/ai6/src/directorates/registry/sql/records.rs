@@ -1,0 +1,1036 @@
+//! The smaller record families: access tokens, audit, Agent roles, Cables and their
+//! quotas, quarantines, Sleeper authorizations, Station logbooks, the timeline and the
+//! usage ledger.
+
+use std::io;
+
+use super::db::Tx;
+use super::{SqlRegistry, bounded_json, from_json, row_limit, to_json};
+use crate::bounds::Limit;
+use crate::directorates::m::roster::AgentRole;
+use crate::directorates::medical::quarantine::Incident;
+use crate::directorates::medical::usage::{MissionUsage, UsageTotals};
+use crate::directorates::registry::cables::{Cable, CableState};
+use crate::directorates::registry::limits::{CableLimits, QuarantineLimits, TimelineLimits};
+use crate::directorates::registry::logbook::{LogbookStore, StationReport, append_report};
+use crate::directorates::registry::quarantine::{
+    Quarantine, QuarantineStore, add_incident, quarantine_report, validate_quarantine,
+};
+use crate::directorates::registry::sleepers::{
+    Fire, Sleeper, SleeperAuthorization, SleeperMark, SleeperStore, fire_round,
+};
+use crate::directorates::registry::store::{
+    AccessTokenStore, AgentRoleStore, AuditRecord, AuditStore, CableStore, cable_error,
+    cable_sent_event, check_quota_buckets, extended_token, invalid_data, quota_allows,
+    quota_balances, revoked_token, sign_in_stands, unix_time, validate_access_token_record,
+    validate_cable_id, validate_registry_key, validate_station_id, validate_token_digest,
+    validate_token_id,
+};
+use crate::directorates::registry::timeline::{TimelineEvent, TimelineStore};
+use crate::directorates::registry::usage::{UsageStore, add_usage, cost_on_day, parse_ledger};
+
+impl AccessTokenStore for SqlRegistry {
+    fn store_access_token(&self, record: &crate::AccessTokenRecord) -> io::Result<()> {
+        let record = validate_access_token_record(record)?;
+        let text = bounded_json(
+            &record,
+            self.limits.tokens.record_bytes,
+            "access token record",
+        )?;
+        self.write(|tx, revision| {
+            let taken = tx.query_opt(
+                "SELECT token_id FROM ai6_access_tokens WHERE token_id = $1 OR digest = $2",
+                &[record.token_id().into(), record.digest().into()],
+            )?;
+            if taken.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "access token ID or digest already exists",
+                ));
+            }
+            tx.execute(
+                "INSERT INTO ai6_access_tokens (token_id, digest, record, revision) \
+                 VALUES ($1, $2, $3, $4)",
+                &[
+                    record.token_id().into(),
+                    record.digest().into(),
+                    text.into(),
+                    revision.into(),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn find_access_token(&self, digest: &str) -> io::Result<Option<crate::AccessTokenRecord>> {
+        validate_token_digest(digest)?;
+        let limit = self.limits.tokens.record_bytes;
+        self.read(|tx| {
+            let Some(record) = token_by_digest(tx, digest, limit)? else {
+                return Ok(None);
+            };
+            if record.is_session_cookie() || !record.active_at(unix_time()?) {
+                return Ok(None);
+            }
+            let sign_in = match record.sign_in() {
+                Some(sign_in) => token_by_id(tx, sign_in, limit)?,
+                None => None,
+            };
+            Ok(sign_in_stands(&record, sign_in.as_ref()).then_some(record))
+        })
+    }
+
+    fn find_session_cookie(&self, digest: &str) -> io::Result<Option<crate::AccessTokenRecord>> {
+        validate_token_digest(digest)?;
+        let limit = self.limits.tokens.record_bytes;
+        self.read(|tx| {
+            let Some(record) = token_by_digest(tx, digest, limit)? else {
+                return Ok(None);
+            };
+            Ok((record.is_session_cookie() && record.active_at(unix_time()?)).then_some(record))
+        })
+    }
+
+    fn login_by_id(&self, token_id: &str) -> io::Result<Option<crate::AccessTokenRecord>> {
+        validate_token_id(token_id)?;
+        let limit = self.limits.tokens.record_bytes;
+        self.read(|tx| {
+            let Some(record) = token_by_id(tx, token_id, limit)? else {
+                return Ok(None);
+            };
+            if !record.active_at(unix_time()?) {
+                return Ok(None);
+            }
+            let sign_in = match record.sign_in() {
+                Some(sign_in) => token_by_id(tx, sign_in, limit)?,
+                None => None,
+            };
+            Ok(sign_in_stands(&record, sign_in.as_ref()).then_some(record))
+        })
+    }
+
+    fn revoke_access_token(&self, token_id: &str) -> io::Result<bool> {
+        validate_token_id(token_id)?;
+        self.write(|tx, revision| {
+            let Some(row) = tx.query_opt(
+                "SELECT record FROM ai6_access_tokens WHERE token_id = $1",
+                &[token_id.into()],
+            )?
+            else {
+                return Ok(false);
+            };
+            let Some(record) = stored_token(&row.text(0)?, self.limits.tokens.record_bytes) else {
+                return Ok(false);
+            };
+            if record.token_id() != token_id || record.revoked_at().is_some() {
+                return Ok(false);
+            }
+            let now = unix_time()?;
+            if let Some(sign_in) = record.sign_in() {
+                let cookie = token_by_id(tx, sign_in, self.limits.tokens.record_bytes)?;
+                if let Some(cookie) = cookie.filter(|cookie| cookie.revoked_at().is_none()) {
+                    tx.execute(
+                        "UPDATE ai6_access_tokens SET record = $2, revision = $3 WHERE token_id = $1",
+                        &[
+                            sign_in.into(),
+                            to_json(&revoked_token(&cookie, now)?)?.into(),
+                            revision.into(),
+                        ],
+                    )?;
+                }
+            }
+            tx.execute(
+                "UPDATE ai6_access_tokens SET record = $2, revision = $3 WHERE token_id = $1",
+                &[
+                    token_id.into(),
+                    to_json(&revoked_token(&record, now)?)?.into(),
+                    revision.into(),
+                ],
+            )?;
+            Ok(true)
+        })
+    }
+
+    fn extend_access_token(
+        &self,
+        token_id: &str,
+        expires_at: f64,
+    ) -> io::Result<Option<crate::AccessTokenRecord>> {
+        validate_token_id(token_id)?;
+        self.write(|tx, revision| {
+            let Some(row) = tx.query_opt(
+                "SELECT record FROM ai6_access_tokens WHERE token_id = $1",
+                &[token_id.into()],
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some(record) = stored_token(&row.text(0)?, self.limits.tokens.record_bytes) else {
+                return Ok(None);
+            };
+            if record.token_id() != token_id {
+                return Ok(None);
+            }
+            let Some(extended) = extended_token(&record, expires_at, unix_time()?)? else {
+                return Ok(None);
+            };
+            if extended.expires_at() > record.expires_at() {
+                tx.execute(
+                    "UPDATE ai6_access_tokens SET record = $2, revision = $3 WHERE token_id = $1",
+                    &[token_id.into(), to_json(&extended)?.into(), revision.into()],
+                )?;
+            }
+            Ok(Some(extended))
+        })
+    }
+}
+
+/// The valid record stored under `digest`, active or not.
+fn token_by_digest(
+    tx: &mut Tx<'_>,
+    digest: &str,
+    limit: Limit,
+) -> io::Result<Option<crate::AccessTokenRecord>> {
+    let text = tx
+        .query_opt(
+            "SELECT record FROM ai6_access_tokens WHERE digest = $1",
+            &[digest.into()],
+        )?
+        .map(|row| row.text(0))
+        .transpose()?;
+    Ok(text
+        .and_then(|text| stored_token(&text, limit))
+        .filter(|record| record.digest() == digest))
+}
+
+/// The valid record stored as `token_id`, active or not.
+fn token_by_id(
+    tx: &mut Tx<'_>,
+    token_id: &str,
+    limit: Limit,
+) -> io::Result<Option<crate::AccessTokenRecord>> {
+    let text = tx
+        .query_opt(
+            "SELECT record FROM ai6_access_tokens WHERE token_id = $1",
+            &[token_id.into()],
+        )?
+        .map(|row| row.text(0))
+        .transpose()?;
+    Ok(text
+        .and_then(|text| stored_token(&text, limit))
+        .filter(|record| record.token_id() == token_id))
+}
+
+/// A stored token record that is within bounds and valid.
+fn stored_token(text: &str, limit: Limit) -> Option<crate::AccessTokenRecord> {
+    if !limit.allows(text.len()) {
+        return None;
+    }
+    let record = serde_json::from_str::<crate::AccessTokenRecord>(text).ok()?;
+    validate_access_token_record(&record).ok()
+}
+
+impl AuditStore for SqlRegistry {
+    fn record_audit(&self, entry: &AuditRecord) -> io::Result<()> {
+        entry.validate()?;
+        let text = bounded_json(entry, self.limits.audit.record_bytes, "audit entry")?;
+        self.write(|tx, revision| {
+            tx.execute(
+                "INSERT INTO ai6_audit (id, at, record, revision) VALUES ($1, $2, $3, $4)",
+                &[
+                    entry.id.as_str().into(),
+                    entry.at.into(),
+                    text.into(),
+                    revision.into(),
+                ],
+            )
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::AlreadyExists => io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "audit entry ID already exists",
+                ),
+                _ => error,
+            })?;
+            Ok(())
+        })
+    }
+
+    fn list_audit(&self, limit: usize) -> io::Result<Vec<AuditRecord>> {
+        let most = self.limits.audit.results;
+        if limit == 0 || !most.allows(limit) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("audit result limit must be between 1 and {most}"),
+            ));
+        }
+        let mut records = self.audit_records()?;
+        records.sort_by(|left, right| {
+            right
+                .at
+                .total_cmp(&left.at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        records.truncate(limit);
+        Ok(records)
+    }
+
+    fn audit_records(&self) -> io::Result<Vec<AuditRecord>> {
+        let rows = self.read(|tx| {
+            tx.query(
+                "SELECT record FROM ai6_audit LIMIT $1",
+                &[row_limit(self.limits.audit.records)
+                    .saturating_add(1)
+                    .into()],
+            )
+        })?;
+        if !self.limits.audit.records.allows(rows.len()) {
+            return Err(invalid_data(format!(
+                "Registry has more than {} audit entries",
+                self.limits.audit.records
+            )));
+        }
+        let mut records = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let Ok(entry) = serde_json::from_str::<AuditRecord>(&row.text(0)?)
+                && entry.validate().is_ok()
+            {
+                records.push(entry);
+            }
+        }
+        Ok(records)
+    }
+}
+
+impl AgentRoleStore for SqlRegistry {
+    fn put_agent_role(&self, operation: &str, role: &AgentRole) -> io::Result<()> {
+        validate_registry_key(operation)?;
+        validate_registry_key(&role.id)?;
+        role.validate()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        let text = bounded_json(
+            role,
+            self.limits.agent_roles.record_bytes,
+            "Agent role configuration",
+        )?;
+        self.write(|tx, revision| {
+            let ids = tx
+                .query(
+                    "SELECT id FROM ai6_agent_roles WHERE operation = $1",
+                    &[operation.into()],
+                )?
+                .into_iter()
+                .map(|row| row.text(0))
+                .collect::<io::Result<Vec<_>>>()?;
+            let most = self.limits.agent_roles.records;
+            if !ids.contains(&role.id) && !most.allows(ids.len() + 1) {
+                return Err(invalid_data(format!(
+                    "Operation has reached the {most} Agent role limit"
+                )));
+            }
+            tx.execute(
+                "INSERT INTO ai6_agent_roles (operation, id, role, revision) VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (operation, id) DO UPDATE SET role = excluded.role, \
+                 revision = excluded.revision",
+                &[
+                    operation.into(),
+                    role.id.as_str().into(),
+                    text.into(),
+                    revision.into(),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn list_agent_roles(&self, operation: &str) -> io::Result<Vec<AgentRole>> {
+        validate_registry_key(operation)?;
+        let rows = self.read(|tx| {
+            tx.query(
+                "SELECT id, role FROM ai6_agent_roles WHERE operation = $1 ORDER BY id",
+                &[operation.into()],
+            )
+        })?;
+        let mut roles = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let Ok(role) = serde_json::from_str::<AgentRole>(&row.text(1)?)
+                && role.validate().is_ok()
+                && role.id == row.text(0)?
+            {
+                roles.push(role);
+            }
+        }
+        Ok(roles)
+    }
+
+    fn agent_role(&self, operation: &str, key: &str) -> io::Result<Option<AgentRole>> {
+        Ok(self
+            .list_agent_roles(operation)?
+            .into_iter()
+            .filter(|role| key == role.id || key.starts_with(&format!("{}/", role.id)))
+            .max_by_key(|role| role.id.len()))
+    }
+
+    fn remove_agent_role(&self, operation: &str, role_id: &str) -> io::Result<bool> {
+        validate_registry_key(operation)?;
+        validate_registry_key(role_id)?;
+        self.write(|tx, _| {
+            Ok(tx.execute(
+                "DELETE FROM ai6_agent_roles WHERE operation = $1 AND id = $2",
+                &[operation.into(), role_id.into()],
+            )? > 0)
+        })
+    }
+}
+
+fn cable_from(text: &str, limits: &CableLimits) -> io::Result<Cable> {
+    if !limits.record_bytes.allows(text.len()) {
+        return Err(invalid_data("Cable record exceeds the size limit"));
+    }
+    from_json(text, "Cable")
+}
+
+/// Unexpired Cables in creation order; unreadable ones are skipped as the file Registry
+/// skips them.
+fn live_cables(tx: &mut Tx<'_>, now: f64, limits: &CableLimits) -> io::Result<Vec<Cable>> {
+    let rows = tx.query(
+        "SELECT cable FROM ai6_cables WHERE expires_at > $1 ORDER BY created_at, id LIMIT $2",
+        &[now.into(), row_limit(limits.records).into()],
+    )?;
+    let mut cables = Vec::with_capacity(rows.len());
+    for row in rows {
+        if let Ok(cable) = cable_from(&row.text(0)?, limits) {
+            cables.push(cable);
+        }
+    }
+    Ok(cables)
+}
+
+fn cable_in(tx: &mut Tx<'_>, id: &str, limits: &CableLimits) -> io::Result<Option<Cable>> {
+    tx.query_opt("SELECT cable FROM ai6_cables WHERE id = $1", &[id.into()])?
+        .map(|row| cable_from(&row.text(0)?, limits))
+        .transpose()
+}
+
+fn check_now(now: Option<f64>, what: &str) -> io::Result<f64> {
+    let now = now.map_or_else(unix_time, Ok)?;
+    if !now.is_finite() {
+        return Err(invalid_data(format!("{what} time must be finite")));
+    }
+    Ok(now)
+}
+
+impl CableStore for SqlRegistry {
+    fn submit_cable(&self, cable: &Cable) -> io::Result<Cable> {
+        let text = bounded_json(cable, self.limits.cables.record_bytes, "Cable record")?;
+        self.write(|tx, revision| {
+            if let Some(row) = tx.query_opt(
+                "SELECT cable FROM ai6_cables WHERE sender_agent = $1 AND idempotency_key = $2",
+                &[cable.sender_agent().into(), cable.idempotency_key().into()],
+            )? {
+                let existing = cable_from(&row.text(0)?, &self.limits.cables)?;
+                if existing.same_request(cable) {
+                    return Ok(existing);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "Cable idempotency key was reused for different content",
+                ));
+            }
+            if cable_in(tx, cable.id(), &self.limits.cables)?.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("Cable {} already exists", cable.id()),
+                ));
+            }
+            tx.execute(
+                "INSERT INTO ai6_cables (id, sender_agent, idempotency_key, created_at, expires_at, cable, revision) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                &[
+                    cable.id().into(),
+                    cable.sender_agent().into(),
+                    cable.idempotency_key().into(),
+                    cable.created_at().into(),
+                    cable.expires_at().into(),
+                    text.into(),
+                    revision.into(),
+                ],
+            )?;
+            // The Cable is sent either way; an event out of bounds is not recorded.
+            let event = cable_sent_event(cable);
+            if event.to_record(&self.limits.timeline).is_ok() {
+                insert_event(tx, &event, revision, &self.limits.timeline)?;
+            }
+            Ok(cable.clone())
+        })
+    }
+
+    fn find_cable(&self, sender_agent: &str, idempotency_key: &str) -> io::Result<Option<Cable>> {
+        self.read(|tx| {
+            tx.query_opt(
+                "SELECT cable FROM ai6_cables WHERE sender_agent = $1 AND idempotency_key = $2",
+                &[sender_agent.into(), idempotency_key.into()],
+            )?
+            .map(|row| cable_from(&row.text(0)?, &self.limits.cables))
+            .transpose()
+        })
+    }
+
+    fn get_cable(&self, cable_id: &str) -> io::Result<Option<Cable>> {
+        validate_cable_id(cable_id)?;
+        self.read(|tx| cable_in(tx, cable_id, &self.limits.cables))
+    }
+
+    fn cable_inbox(
+        &self,
+        agent: &str,
+        session_id: Option<&str>,
+        limit: usize,
+        now: Option<f64>,
+    ) -> io::Result<Vec<Cable>> {
+        if agent.trim().is_empty() || limit == 0 || !self.limits.cables.page.allows(limit) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "agent must be non-empty and limit must be between 1 and 1000",
+            ));
+        }
+        let now = check_now(now, "Cable inbox")?;
+        let mut cables = self
+            .read(|tx| live_cables(tx, now, &self.limits.cables))?
+            .into_iter()
+            .filter(|cable| {
+                cable.recipients().iter().any(|recipient| {
+                    recipient.agent() == agent
+                        && recipient
+                            .session_id()
+                            .is_none_or(|target| Some(target) == session_id)
+                        && matches!(
+                            recipient.state(),
+                            CableState::Queued | CableState::Delivered
+                        )
+                })
+            })
+            .collect::<Vec<_>>();
+        cables.truncate(limit);
+        Ok(cables)
+    }
+
+    fn cables_from(
+        &self,
+        sender_agent: &str,
+        limit: usize,
+        now: Option<f64>,
+    ) -> io::Result<Vec<Cable>> {
+        if sender_agent.trim().is_empty() || limit == 0 || !self.limits.cables.page.allows(limit) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "sender must be non-empty and limit within [registry.limits.cables] page",
+            ));
+        }
+        let now = check_now(now, "Cables from a sender")?;
+        let mut cables = self
+            .read(|tx| live_cables(tx, now, &self.limits.cables))?
+            .into_iter()
+            .filter(|cable| cable.sender_agent() == sender_agent)
+            .collect::<Vec<_>>();
+        cables.sort_by(|left, right| {
+            left.created_at()
+                .total_cmp(&right.created_at())
+                .then_with(|| left.id().cmp(right.id()))
+        });
+        cables.truncate(limit);
+        Ok(cables)
+    }
+
+    fn held_cables(&self, limit: usize, now: Option<f64>) -> io::Result<Vec<Cable>> {
+        if limit == 0 || !self.limits.cables.page.allows(limit) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "held Cable limit is outside [registry.limits.cables] page",
+            ));
+        }
+        let now = check_now(now, "held Cable")?;
+        let mut cables = self
+            .read(|tx| live_cables(tx, now, &self.limits.cables))?
+            .into_iter()
+            .filter(|cable| {
+                cable
+                    .recipients()
+                    .iter()
+                    .any(|recipient| recipient.state() == CableState::Held)
+            })
+            .collect::<Vec<_>>();
+        cables.truncate(limit);
+        Ok(cables)
+    }
+
+    fn update_cable_delivery(
+        &self,
+        cable_id: &str,
+        agent: &str,
+        session_id: Option<&str>,
+        state: CableState,
+        taken_by: Option<&str>,
+        now: Option<f64>,
+    ) -> io::Result<Option<Cable>> {
+        validate_cable_id(cable_id)?;
+        self.write(|tx, revision| {
+            let Some(cable) = cable_in(tx, cable_id, &self.limits.cables)? else {
+                return Ok(None);
+            };
+            let now = check_now(now, "Cable delivery")?;
+            let next_state = if cable.expires_at() <= now && state != CableState::Expired {
+                CableState::Expired
+            } else {
+                state
+            };
+            let Some(updated) = cable
+                .with_recipient_taken(agent, session_id, next_state, taken_by)
+                .map_err(cable_error)?
+            else {
+                return Ok(None);
+            };
+            tx.execute(
+                "UPDATE ai6_cables SET cable = $2, revision = $3 WHERE id = $1",
+                &[
+                    updated.id().into(),
+                    bounded_json(&updated, self.limits.cables.record_bytes, "Cable record")?.into(),
+                    revision.into(),
+                ],
+            )?;
+            Ok(Some(updated))
+        })
+    }
+
+    fn take_quotas(&self, buckets: &[(&str, f64, u32)], now: f64) -> io::Result<bool> {
+        check_quota_buckets(buckets, now)?;
+        self.write(|tx, revision| {
+            let balances = quota_balances(buckets, now, |key| {
+                tx.query_opt(
+                    "SELECT tokens, updated FROM ai6_cable_quotas WHERE key = $1",
+                    &[key.into()],
+                )?
+                .map(|row| Ok((row.real(0)?, row.real(1)?)))
+                .transpose()
+            })?;
+            let allowed = quota_allows(&balances);
+            for balance in &balances {
+                match balance.remaining(allowed) {
+                    Some(tokens) => tx.execute(
+                        "INSERT INTO ai6_cable_quotas (key, tokens, updated, revision) \
+                         VALUES ($1, $2, $3, $4) ON CONFLICT (key) DO UPDATE SET \
+                         tokens = excluded.tokens, updated = excluded.updated, \
+                         revision = excluded.revision",
+                        &[
+                            balance.key.as_str().into(),
+                            tokens.into(),
+                            now.into(),
+                            revision.into(),
+                        ],
+                    )?,
+                    None => tx.execute(
+                        "DELETE FROM ai6_cable_quotas WHERE key = $1",
+                        &[balance.key.as_str().into()],
+                    )?,
+                };
+            }
+            Ok(allowed)
+        })
+    }
+}
+
+/// Records `event` and drops the oldest past `limits.records`.
+fn insert_event(
+    tx: &mut Tx<'_>,
+    event: &TimelineEvent,
+    revision: i64,
+    limits: &TimelineLimits,
+) -> io::Result<()> {
+    let record = String::from_utf8(event.to_record(limits)?)
+        .map_err(|_| invalid_data("timeline event is not UTF-8"))?;
+    tx.execute(
+        "INSERT INTO ai6_timeline (id, operation, at_micros, event, revision) \
+         VALUES ($1, $2, $3, $4, $5)",
+        &[
+            event.id.as_str().into(),
+            event.operation.as_str().into(),
+            i64::try_from(event.micros()).unwrap_or(i64::MAX).into(),
+            record.into(),
+            revision.into(),
+        ],
+    )?;
+    let count = tx
+        .query_opt("SELECT count(*) FROM ai6_timeline", &[])?
+        .map_or(Ok(0), |row| row.int(0))?;
+    let excess = count.saturating_sub(row_limit(limits.records));
+    if excess > 0 {
+        tx.execute(
+            "DELETE FROM ai6_timeline WHERE id IN \
+             (SELECT id FROM ai6_timeline ORDER BY at_micros, id LIMIT $1)",
+            &[excess.into()],
+        )?;
+    }
+    Ok(())
+}
+
+impl TimelineStore for SqlRegistry {
+    fn record_event(&self, event: &TimelineEvent) -> io::Result<()> {
+        event.to_record(&self.limits.timeline)?;
+        self.write(|tx, revision| insert_event(tx, event, revision, &self.limits.timeline))
+    }
+
+    fn timeline_events(&self, operation: &str) -> io::Result<Vec<TimelineEvent>> {
+        let rows = self.read(|tx| {
+            tx.query(
+                "SELECT event FROM ai6_timeline WHERE operation = $1 ORDER BY at_micros, id",
+                &[operation.into()],
+            )
+        })?;
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let Some(event) =
+                TimelineEvent::from_record(row.text(0)?.as_bytes(), &self.limits.timeline)
+                && event.operation == operation
+            {
+                events.push(event);
+            }
+        }
+        Ok(events)
+    }
+}
+
+/// The stored scope of a quarantine: its Operation, or '' for every Operation.
+fn scope(operation: Option<&str>) -> &str {
+    operation.unwrap_or("")
+}
+
+fn quarantine_from(text: &str, limits: &QuarantineLimits) -> io::Result<Quarantine> {
+    if !limits.record_bytes.allows(text.len()) {
+        return Err(invalid_data("quarantine record exceeds the size limit"));
+    }
+    from_json(text, "quarantine record")
+}
+
+impl QuarantineStore for SqlRegistry {
+    fn quarantine_agent(&self, record: &Quarantine) -> io::Result<Quarantine> {
+        validate_quarantine(record)?;
+        let text = to_json(record)?;
+        self.write(|tx, revision| {
+            let scope = scope(record.operation.as_deref());
+            if let Some(row) = tx.query_opt(
+                "SELECT record FROM ai6_quarantines WHERE agent = $1 AND scope = $2",
+                &[record.agent.as_str().into(), scope.into()],
+            )? {
+                return quarantine_from(&row.text(0)?, &self.limits.quarantine);
+            }
+            let count = tx
+                .query_opt("SELECT count(*) FROM ai6_quarantines", &[])?
+                .map_or(Ok(0), |row| row.int(0))?;
+            if !self.limits.quarantine.records.allows(count + 1) {
+                return Err(io::Error::other("too many quarantine records"));
+            }
+            tx.execute(
+                "INSERT INTO ai6_quarantines (agent, scope, record, revision) VALUES ($1, $2, $3, $4)",
+                &[
+                    record.agent.as_str().into(),
+                    scope.into(),
+                    text.into(),
+                    revision.into(),
+                ],
+            )?;
+            // In the same transaction, so no Station reads the raise once the quarantine is
+            // stored.
+            super::agents::remove_raises_in(
+                tx,
+                &record.agent,
+                record.operation.as_deref(),
+                &self.limits.clearance,
+            )?;
+            // A full or unreadable Agent record never keeps a quarantine from being stored.
+            let _ = super::agents::count_in(
+                tx,
+                revision,
+                &quarantine_report(record),
+                &self.limits.agents,
+            );
+            Ok(record.clone())
+        })
+    }
+
+    fn release_quarantine(&self, agent: &str, operation: Option<&str>) -> io::Result<bool> {
+        self.write(|tx, _| {
+            Ok(tx.execute(
+                "DELETE FROM ai6_quarantines WHERE agent = $1 AND scope = $2",
+                &[agent.into(), scope(operation).into()],
+            )? > 0)
+        })
+    }
+
+    fn quarantines(&self) -> io::Result<Vec<Quarantine>> {
+        let rows = self.read(|tx| tx.query("SELECT record FROM ai6_quarantines", &[]))?;
+        let mut records = rows
+            .into_iter()
+            .map(|row| quarantine_from(&row.text(0)?, &self.limits.quarantine))
+            .collect::<io::Result<Vec<_>>>()?;
+        records.sort_by(|left, right| {
+            (&left.agent, &left.operation).cmp(&(&right.agent, &right.operation))
+        });
+        Ok(records)
+    }
+
+    fn is_quarantined(&self, agent: &str, operation: Option<&str>) -> io::Result<bool> {
+        Ok(self
+            .quarantines()?
+            .iter()
+            .any(|record| record.covers(agent, operation)))
+    }
+
+    fn record_incident(&self, agent: &str, incident: Incident) -> io::Result<Vec<Incident>> {
+        self.write(|tx, revision| {
+            let mut history: Vec<Incident> = match tx.query_opt(
+                "SELECT history FROM ai6_incidents WHERE agent = $1",
+                &[agent.into()],
+            )? {
+                Some(row) => from_json(&row.text(0)?, "incident history")?,
+                None => Vec::new(),
+            };
+            add_incident(&mut history, incident, &self.limits.quarantine);
+            tx.execute(
+                "INSERT INTO ai6_incidents (agent, history, revision) VALUES ($1, $2, $3) \
+                 ON CONFLICT (agent) DO UPDATE SET history = excluded.history, \
+                 revision = excluded.revision",
+                &[agent.into(), to_json(&history)?.into(), revision.into()],
+            )?;
+            Ok(history)
+        })
+    }
+}
+
+impl SleeperStore for SqlRegistry {
+    fn authorize_sleeper(
+        &self,
+        operation: &str,
+        name: &str,
+        sleeper: &Sleeper,
+        authorized_by: &str,
+        at: i64,
+    ) -> io::Result<()> {
+        sleeper.validate().map_err(invalid_data)?;
+        sleeper
+            .check_size(&self.limits.sleepers)
+            .map_err(invalid_data)?;
+        let event = TimelineEvent::new("sleeper", "authorized", operation, at as f64)
+            .actor(authorized_by)
+            .detail("sleeper", name);
+        self.write(|tx, revision| {
+            let replaced: Option<SleeperAuthorization> = tx
+                .query_opt(
+                    "SELECT record FROM ai6_sleeper_authorizations \
+                     WHERE operation = $1 AND name = $2",
+                    &[operation.into(), name.into()],
+                )?
+                .map(|row| from_json(&row.text(0)?, "Sleeper authorization"))
+                .transpose()?;
+            let record = SleeperAuthorization {
+                fingerprint: sleeper.fingerprint(),
+                authorized_by: authorized_by.to_owned(),
+                at,
+                mark: replaced.and_then(|approval| approval.mark),
+            };
+            tx.execute(
+                "INSERT INTO ai6_sleeper_authorizations (operation, name, record, revision) \
+                 VALUES ($1, $2, $3, $4) ON CONFLICT (operation, name) \
+                 DO UPDATE SET record = excluded.record, revision = excluded.revision",
+                &[
+                    operation.into(),
+                    name.into(),
+                    to_json(&record)?.into(),
+                    revision.into(),
+                ],
+            )?;
+            // The approval stands either way; an event out of bounds is not recorded.
+            if event.to_record(&self.limits.timeline).is_ok() {
+                insert_event(tx, &event, revision, &self.limits.timeline)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn sleeper_authorization(
+        &self,
+        operation: &str,
+        name: &str,
+    ) -> io::Result<Option<SleeperAuthorization>> {
+        self.read(|tx| {
+            tx.query_opt(
+                "SELECT record FROM ai6_sleeper_authorizations WHERE operation = $1 AND name = $2",
+                &[operation.into(), name.into()],
+            )?
+            .map(|row| from_json(&row.text(0)?, "Sleeper authorization"))
+            .transpose()
+        })
+    }
+
+    fn revoke_sleeper(&self, operation: &str, name: &str) -> io::Result<bool> {
+        self.write(|tx, revision| {
+            let removed = tx.execute(
+                "DELETE FROM ai6_sleeper_authorizations WHERE operation = $1 AND name = $2",
+                &[operation.into(), name.into()],
+            )? > 0;
+            if removed && let Ok(at) = unix_time() {
+                let event =
+                    TimelineEvent::new("sleeper", "revoked", operation, at).detail("sleeper", name);
+                if event.to_record(&self.limits.timeline).is_ok() {
+                    insert_event(tx, &event, revision, &self.limits.timeline)?;
+                }
+            }
+            Ok(removed)
+        })
+    }
+
+    fn mark_sleeper(&self, operation: &str, name: &str, mark: &SleeperMark) -> io::Result<bool> {
+        self.write(|tx, revision| {
+            let approval: Option<SleeperAuthorization> = tx
+                .query_opt(
+                    "SELECT record FROM ai6_sleeper_authorizations \
+                     WHERE operation = $1 AND name = $2",
+                    &[operation.into(), name.into()],
+                )?
+                .map(|row| from_json(&row.text(0)?, "Sleeper authorization"))
+                .transpose()?;
+            let Some(mut approval) = approval else {
+                return Ok(false);
+            };
+            approval.mark = Some(mark.clone());
+            tx.execute(
+                "UPDATE ai6_sleeper_authorizations SET record = $3, revision = $4 \
+                 WHERE operation = $1 AND name = $2",
+                &[
+                    operation.into(),
+                    name.into(),
+                    to_json(&approval)?.into(),
+                    revision.into(),
+                ],
+            )?;
+            Ok(true)
+        })
+    }
+
+    fn fire_sleeper(
+        &self,
+        operation: &str,
+        name: &str,
+        sleeper: &Sleeper,
+        round: (i64, Option<&str>),
+        received_by: &str,
+    ) -> io::Result<Fire> {
+        fire_round(self, (operation, name, sleeper), round, received_by)
+    }
+}
+
+impl LogbookStore for SqlRegistry {
+    fn file_station_report(&self, report: &StationReport) -> io::Result<()> {
+        report.validate(&self.limits.logbook)?;
+        self.write(|tx, revision| {
+            let mut logbook: Vec<StationReport> = match tx.query_opt(
+                "SELECT reports FROM ai6_logbooks WHERE station = $1",
+                &[report.station.as_str().into()],
+            )? {
+                Some(row) => from_json(&row.text(0)?, "Station logbook")?,
+                None => Vec::new(),
+            };
+            append_report(&mut logbook, report, &self.limits.logbook);
+            let text = bounded_json(
+                &logbook,
+                self.limits.logbook.record_bytes(),
+                "Station logbook",
+            )?;
+            tx.execute(
+                "INSERT INTO ai6_logbooks (station, reports, revision) VALUES ($1, $2, $3) \
+                 ON CONFLICT (station) DO UPDATE SET reports = excluded.reports, \
+                 revision = excluded.revision",
+                &[report.station.as_str().into(), text.into(), revision.into()],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn logbook(&self, station: &str) -> io::Result<Vec<StationReport>> {
+        validate_station_id(station)?;
+        self.read(|tx| {
+            match tx.query_opt(
+                "SELECT reports FROM ai6_logbooks WHERE station = $1",
+                &[station.into()],
+            )? {
+                Some(row) => from_json(&row.text(0)?, "Station logbook"),
+                None => Ok(Vec::new()),
+            }
+        })
+    }
+}
+
+impl UsageStore for SqlRegistry {
+    fn record_usage(
+        &self,
+        operation: Option<&str>,
+        mission: &str,
+        session: &str,
+        delta: &UsageTotals,
+        now: i64,
+    ) -> io::Result<MissionUsage> {
+        let operation = operation.unwrap_or("");
+        self.write(|tx, revision| {
+            let mut usage = match tx.query_opt(
+                "SELECT ledger FROM ai6_usage WHERE operation = $1 AND mission = $2",
+                &[operation.into(), mission.into()],
+            )? {
+                Some(row) => parse_ledger(row.text(0)?.as_bytes(), &self.limits.usage)?,
+                None => MissionUsage::default(),
+            };
+            add_usage(&mut usage, session, delta, now, &self.limits.usage);
+            tx.execute(
+                "INSERT INTO ai6_usage (operation, mission, ledger, revision) VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (operation, mission) DO UPDATE SET ledger = excluded.ledger, \
+                 revision = excluded.revision",
+                &[
+                    operation.into(),
+                    mission.into(),
+                    to_json(&usage)?.into(),
+                    revision.into(),
+                ],
+            )?;
+            Ok(usage)
+        })
+    }
+
+    fn mission_usage(
+        &self,
+        operation: Option<&str>,
+        mission: &str,
+    ) -> io::Result<Option<MissionUsage>> {
+        self.read(|tx| {
+            tx.query_opt(
+                "SELECT ledger FROM ai6_usage WHERE operation = $1 AND mission = $2",
+                &[operation.unwrap_or("").into(), mission.into()],
+            )?
+            .map(|row| parse_ledger(row.text(0)?.as_bytes(), &self.limits.usage))
+            .transpose()
+        })
+    }
+
+    fn operation_cost_on_day(&self, operation: Option<&str>, now: i64) -> io::Result<u64> {
+        let rows = self.read(|tx| {
+            tx.query(
+                "SELECT ledger FROM ai6_usage WHERE operation = $1",
+                &[operation.unwrap_or("").into()],
+            )
+        })?;
+        let mut total = 0_u64;
+        for row in rows {
+            total = total.saturating_add(cost_on_day(
+                &parse_ledger(row.text(0)?.as_bytes(), &self.limits.usage)?,
+                now,
+            ));
+        }
+        Ok(total)
+    }
+}

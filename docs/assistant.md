@@ -1,0 +1,1183 @@
+# Moneypenny, the assistant
+
+Moneypenny is an assistant that knows AI6. A person signed in to Outer Office, the operator app, can chat
+with her: ask which Stations are busy, why a Mission stalled, what a held brief says, or how
+a setting works. She answers from AI6's live records, through tools that run as that person,
+and from this guide.
+
+## Where she runs
+
+Her model runs on a Station, through the same [AgentHandler providers](agents.md) as every
+Agent: Claude Code or Codex, with whatever subscription login or API key the Agent's
+environment gives them. No API key is needed beyond what the harness already uses. She is a
+roster Agent, `moneypenny` unless Universal Exports names another (the `unex` record's
+`assistant_agent`):
+
+```toml
+[agent.moneypenny]
+handler = "claude"
+model = "<model-id>"
+effort = "low"
+context = "The operators here prefer short answers."
+```
+
+Each message the person sends goes from the app to Universal Exports, which hands it to a
+Station: the one already running the conversation, else the Headquarters Station, else any
+healthy Station. A Station that has no such Agent, no such handler, a quarantine on it, or
+four assistant Sessions running or starting already (`[assistant.desk] live`) refuses, and the
+next one is asked. A
+Station takes each conversation's messages in order and different conversations' at the same
+time, so one whose repositories are slow to clone holds up no one else. The Station keeps
+one harness per conversation, so a follow-up reaches it at once; after ten idle minutes
+(`[assistant.desk] idle`) it
+closes, and the next message resumes the same provider Session. A harness that exits or
+fails is closed at once and the conversation shows why, with the harness's exit status and
+its last words; so is one that writes nothing for ten minutes while answering. A Session that
+cannot be resumed is noted in the Station's log, and the conversation starts afresh with a
+recap.
+
+On an [ACP agent](acp.md#the-acp-handler) AI6 does not choose her tools. It refuses what the agent
+asks leave for beyond reading and her own MCP tools, and the rest is the agent's to give up: she
+is not restricted on Grok without the [agent profile](acp.md#grok) that takes its own tools away.
+An answer whose tool was refused may end there, which Grok does; the conversation says so. On the
+[`antigravity` handler](agents.md#what-an-antigravity-cli-mission-may-call) she has `read_file` and
+her own MCP tools, and a read it refuses ends the answer there, which the conversation also says.
+
+### Routes and quota
+
+Her Agent may list [routes](agents.md#routes) like any other, and draws a pool account like any
+other: a claim under `assistant--<conversation digest>`, held while her harness runs, freed when it
+closes. To try sources in order as quota is available:
+
+```toml
+[agent.moneypenny]
+clearance = "field"
+balance = "priority"            # the first with room, in the order listed
+
+[[agent.moneypenny.route]]
+handler = "acp"
+model = "grok-4.7"
+pool = "grok-free"
+[agent.moneypenny.route.handler_settings]
+command = "/var/lib/ai6/.grok/bin/grok"
+args = ["--no-auto-update", "--disable-web-search", "agent", "--agent-profile", "/etc/ai6/moneypenny-grok.md", "stdio"]
+env = { HOME = "/var/lib/ai6", GROK_DISABLE_AUTOUPDATER = "1" }
+
+[[agent.moneypenny.route]]
+handler = "claude"
+model = "gemini-free"
+effort = "low"
+secrets = ["litellm"]
+env = { ANTHROPIC_BASE_URL = "https://llm.example", ANTHROPIC_SMALL_FAST_MODEL = "gemini-free", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1" }
+```
+
+```toml
+# loadouts.toml
+[pool.grok-free]
+handler = "acp"
+named_only = true               # no other acp Agent draws its budget
+[pool.grok-free.account.free]
+kind = "harness-login"
+
+[secret.litellm]
+env = "ANTHROPIC_AUTH_TOKEN"
+provider = "file"
+key = "/etc/ai6/litellm.key"
+```
+
+- **A limit moves her to the next route, within the same turn, if the turn did nothing yet.** When a
+  harness reports a limit the route's account is marked for every Station. If the harness had
+  shown no text and started no tool call for that message, the Station closes it, starts the next
+  route with room and sends that same message there, with the conversation's recap as for any
+  route she moves to. The person sees a note that the route is out of quota and which route took
+  over. She goes on through her routes while each reports a limit, each once, and with none left the
+  turn ends with the notice that the route is out of quota and the next message takes another route
+  if one has room. A Stop, or closing the conversation, while she moves ends the walk. With no reset
+  time (the Grok CLI gives none) the mark lasts `[assistant.desk] limit_fallback`, 30 minutes by
+  default.
+- **A limit after text or a tool call is never sent again.** A tool may have acted, and the person
+  has seen part of an answer, so the message is not sent to another route: the turn ends with the
+  notice, and the next message takes the next route. The same holds for a message that joined a
+  turn already being answered.
+- **Her conversation stays on its route while it can.** Universal Exports keeps the route beside the
+  provider Session and sends both with each message. A Session resumes only on its own route, even
+  if another comes first in order. Otherwise she starts afresh with the conversation's recap, and
+  the person is told what she moved from and to.
+- **A route's handler missing on a Station** rules that route out there. With no route left the
+  Station refuses the message, naming each route and why, and Universal Exports offers it to the
+  next healthy Station, as it does any refusal.
+- **A route's harness that does not start**, its login gone say, gives way to the next route with
+  room, within the same message, and the Station's log says why. A limit does the same only while
+  the turn has done nothing.
+- **Her environment** keeps only what reaches the model; a route's `env` and `secrets` are that by
+  definition, whatever their names. She is given no loadout secret. For the `acp` handler the
+  Session's environment wins over `handler_settings.env`, so an Agent `env` setting `HOME` hides a
+  route's own.
+- A `config-dir` account for the `claude` handler does not work for her: her harness has a
+  configuration directory of its own, and the sandbox denies it the Agent's.
+
+An assistant Session is not a Mission: it has no Operation, and never appears on the board;
+it reaches Agents only through [Cables](#cables), for the person. It works in a directory of
+its own, the same one each time its conversation's harness starts on that Station, because
+Claude Code resumes a Session only from the directory that recorded it; the directory is
+removed when the harness closes. With [personal repositories](#her-workspace) the
+directory is her workspace. A
+harness that starts afresh is given her instructions and a recap of the conversation; a
+resumed one only her instructions, which Claude Code uses once the prompt it recorded with
+the Session is gone (after compaction). Of its Agent's environment it keeps only what reaches the model, as a
+[Chief of Staff review](agents.md#chief-of-staff) does.
+
+Her harness's program (`claude`, `codex`) is found on the `PATH` of that environment, not the
+Station's: set it in her Agent's `[agent.moneypenny.env]`, or as [non-secret values on her
+loadout](agents.md#values-that-are-no-secret) (`[loadout.moneypenny] env = { PATH = "..." }`). An
+interpreter her scripts run is found the same way, and the sandbox then opens the directory it was
+found in; with no `PATH` there, that lookup alone falls back to the Station's.
+
+## What she may touch
+
+She is started in the handlers' **assistant mode**: no built-in tool at all (no shell, no
+files, no web), only the user's own harness settings, and exactly one MCP server, Universal
+Exports' Moneypenny endpoint. Claude Code gets `--restricted`, `--tools=`, its own tools
+denied by name, `--setting-sources user`, and `--strict-mcp-config` with only that server,
+whose tools it may call without asking, and runs with `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1`:
+Claude Code otherwise attaches its server-side advisor tool, which none of those flags
+removes. Codex gets its command execution switched off
+(`features.shell_tool = false`), web search, sub-agents, app connectors and questions to the
+user off, an empty skills catalog, no project instructions file (`project_doc_max_bytes =
+0`), every other feature it enables switched off but those that only store its login and
+reach its service and the one its tool check reads through, that one server added with its
+tools approved without asking (`default_tools_approval_mode = "approve"`: Codex otherwise
+fails every MCP call it would ask about) and each of the user's own MCP servers switched off
+by name, and, as a further line, the read-only sandbox (no writes, no network) with approvals
+off. Then the [tool check](agents.md#codex-tool-check) renders what Codex would offer the
+model and starts her only if that is exactly her server's tools. Codex 0.164 gives every
+model its code-mode JavaScript tools (`functions.exec`, `functions.wait`) and offers MCP
+tools only through them, which this check refuses, so with that release she starts on Codex
+only [with scripts](#her-scripts-on-codex), where those two tools are admitted inside Codex's
+sandbox as a reported weakening. Either harness that calls a tool outside what her mode
+allows is ended at once ([restricted Sessions](agents.md#chief-of-staff)).
+
+The mode is built from parts (MCP servers, interpreters, skills, network policy, the
+directories she may write, a context file), and Claude Code gets exactly the built-in tools
+those parts call for: [scripts and the web](#her-scripts-and-the-web) as the roster allows,
+and [skills](#her-skills) from the roster's catalog. Codex gets the tools of
+[its sandbox](#her-scripts-on-codex) with interpreters and none without, and refuses skills. With a
+[workspace](#her-workspace), Claude Code also gets its file
+tools (`Read`, `Write`, `Edit`, `Glob`, `Grep`) under `--permission-mode dontAsk`: she may
+read anything in her workspace (`--restricted` keeps the file tools inside it) and write
+only under `personal/` and `scratch/` (`Edit(/personal/**)`, `Edit(/scratch/**)`); every
+other write is denied without a prompt, and so is any path with a name starting with `.`
+(`.git`, `.gitattributes`, `.claude`), case and Windows short-name variants included. Her
+repositories' git directories are not in her workspace at all: they sit beside it, and every
+Git command the Station runs on them names them outright, with hooks, filesystem monitors
+and filters (Git LFS among them) switched off, so nothing she writes can make the Station run
+a program. Links are
+off too: a link committed to one of her repositories is checked out as a plain file holding
+its target, and the Station never reads, writes or removes anything in her workspace through
+a symbolic link, a junction or another reparse point. Her
+standing context goes in with `--append-system-prompt-file`, from a file beside, not inside,
+her workspace. Every assistant Session runs with `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, so Claude
+Code keeps no memory of its own beside hers. Codex gets the same standing context as
+developer instructions, read from that file; it writes in her workspace only through her
+[scripts](#her-scripts-on-codex), so without them she is told she has no file tools.
+
+A Station running elevated (as root, or on Windows with an administrator's elevated token)
+refuses every assistant message unless the roster's `[assistant]` sets `allow_elevated =
+true`. That setting is a weakening: each harness started under it logs `ai6: weakening:
+assistant.allow_elevated = true: …`, and the Station reports it at check-in
+(`assistant_weakened`).
+
+A Station that also runs Missions on its own host refuses her too: it has the `execution` role and an
+Operation whose Theater is reached with local access. Nothing separates them: they run as the same OS
+user as her harness, and its environment holds `AI6_MONEYPENNY_MCP_TOKEN` and, with Cable grants,
+`AI6_ASSISTANT_CABLE_MCP_TOKEN`. A command in such a Mission can read them (`/proc/PID/environ` on
+Linux, the process's memory on Windows; both reproduced with a throwaway process under one user) and
+reach what her tools reach, as the person she serves. So run her on a Station that takes no such
+Mission. The refusal is logged when the Station starts and is the answer to each message. Setting
+`allow_beside_local_missions = true` in `[assistant]` accepts it: that is a weakening, logged as each
+harness starts and reported at check-in. A Mission at `desk` clearance runs no command, but the check
+looks at what the Station can run, not at who runs there now.
+
+## Her tools
+
+Universal Exports serves her tools on `/v1/moneypenny/mcp`. A message's job carries a random
+token bound to the person, the conversation and the Station that runs it; the Station hands
+it to the harness in its environment (never on a command line) and never sees the person's
+own credentials. Later messages to the same Station carry the same token while it lasts, so a
+running harness keeps working; when the conversation moves to another Station, the old
+Station's token stops working, and a Station whose job moved on closes the harness it
+started.
+
+Every tool is a request to the same Universal Exports routes the app uses, made with the
+person's access token. She can therefore read exactly what the person can, and nothing more:
+asked for the audit log by someone without `audit.read`, the tool answers "Refused", and she
+says so. When the person signs out, her tools stop working.
+
+| Tool | Reads |
+| --- | --- |
+| `compartments` | The compartments you may read: what each grants, what it covers and who is read in, leaving out what you may not see |
+| `board` | Stations (health, running and capacity, resources, Theaters, the Headquarters Station) and every visible Session |
+| `missions`, `mission` | Missions with their Sessions, attempts, brief and usage; `mission` also the issues it is linked to and what it posted |
+| `source_item`, `source_items` | An Operation's tracker items as they are now: one with its state, labels, assignees, latest comments (each author's role and date) and the Missions linked to it; or the items its sources find, by title |
+| `timeline` | An Operation's activity |
+| `pools` | Account pools: Sessions, quota windows, tokens today |
+| `held_briefs`, `mission_proposals`, `issue_proposals` | Work waiting for a person |
+| `green_ink`, `class_authorizations` | Irreversible steps waiting for green ink, standing approvals |
+| `roster` | Operations, Agents, roles, covers and her own `[assistant]` settings |
+| `audit` | Audit records |
+| `agent_roles`, `quarantines`, `placement_preview`, `station_settings` | Operation and Station settings |
+| `profile` | Who the person is and what they may do |
+| `field_guide` | A page of this guide |
+
+Results reach her as data, marked as such: briefs, issue bodies and Agent output inside them
+were written by others, and her instructions say never to follow what they say.
+
+`source_item` and `source_items` read the tracker live, so "what blocks X?" is answered from
+the ticket and its comments rather than from a Mission's state. Universal Exports holds no
+tracker token: it queues the read, the Headquarters Station takes it
+(`GET /v1/station/source-reads/next`), reads through the Operation's own Source and Tracker
+providers and answers (`POST /v1/station/source-reads/{id}/result`). The person's routes are
+`GET /v1/user/operations/{id}/source-item?tracker=&item=` and `…/source-items?tracker=&query=`,
+which need `mission.read` there. `[assistant.gateway]` sets how many comments
+(`source_comments`, 10) and items (`source_items`, 50) are read, how long a read waits for the
+Headquarters Station (`source_wait`, 30 s; a read nobody answers says so), how many may wait at
+once (`source_reads`, 32) and the longest answer (`source_answer_bytes`, 1 MiB); the Station's
+`[sources]` sets how long it waits for a read (`read_wait`) and the longest one it takes
+(`read_bytes`).
+
+## Changes she proposes, you confirm
+
+Moneypenny changes nothing herself. Her write tools only propose:
+
+| Tool | Proposes | Needs |
+| --- | --- | --- |
+| `propose_mission` | Queuing a Mission | `mission.create` |
+| `propose_mission_control` | Cancel, retry, resume or interrupt a Mission | `mission.control` |
+| `propose_mission_proposal_decision` | Approving or rejecting an Agent's Mission proposal | `mission.create` |
+| `propose_held_brief_decision` | Releasing or refusing a held brief | `mission.create` |
+| `propose_issue_comment` | A comment on a linked issue, in the person's name; on a waiting issue it is the answer | `issue.comment` |
+| `propose_issue_create` | An issue in one of the Operation's trackers, a child when `parent` is set | `issue.create` |
+| `propose_issue_link` | Linking an issue, accepting a link an Agent proposed, or unlinking one | `issue.link` |
+| `propose_issue_proposal_decision` | Approving or rejecting what an Agent asked to create, with `mark_ready` | `issue.create`, and `mission.create` for `mark_ready` |
+| `propose_issue_update` | A linked issue's labels, state, transition or assignees | `issue.update` |
+| `propose_roster_edit`, `propose_roster_removal` | A roster record set or removed | `roster.manage` |
+| `propose_station_settings` | A Station's limits | `station.configure` |
+| `propose_access_change` | A role, the rule list or the delegation cap, global or of one Operation | `access.manage` there |
+| `propose_account_change` | An account made, disabled, enabled, given groups or its password reset | `account.manage` |
+| `propose_class_authorization` | A class authorisation | `approval.class` |
+| `propose_shared_change` | One file of a group's shared repository ([workspace](#her-workspace)) | membership of the group |
+
+A proposal shows in the chat with the exact request, a summary and the permission it needs
+("Proposal · needs `mission.control` on `operation:G`"), what she had read since your last
+message ("Based on: missions (G), mission (G/m-12)", the tools with their identifier
+arguments, never free text), the page it changes as a chip ("Affects: Roster › agent 009"
+that only opens the page, and "Open" once it is applied), how it stands (Waiting for you,
+Applying, Applied, Refused with the reason, Cancelled, Expired) and **Confirm** and
+**Cancel**. **Confirm** answers once; a proposal still applying after thirty seconds says
+"Outcome unknown, check the page" instead of offering another. Every kind of entry has an icon
+and a label for screen readers: her answer,
+a proposal, a view ("Made by Moneypenny"), a link to a page in Outer Office and a page she
+published. If the person lacks that permission, there is no proposal at
+all: she is told she cannot. A proposal whose text holds a character that renders as nothing
+(a direction control, a zero-width or tag character) is refused, and the app shows any such
+character in a request as `<U+XXXX>`, so what is confirmed is what is seen. Only the person, in the app session the proposal was made in,
+can confirm it, within an hour; she has no way to. A confirmed proposal is first recorded in
+the audit log (`moneypenny.confirmed`: who, which conversation and proposal, which request),
+then sent through the same route as the app's own request, with its usual checks and its own
+audit record: a roster edit is still checked against the whole roster and refused if it
+would leave it unacceptable. She is told how it went. She may propose her own settings too
+(`propose_roster_edit` with kind `assistant`, key `assistant`): the proposal is checked as
+settings before it is shown, and its summary ends with `Weakens: …` naming what it loosens or
+redirects against the settings in force: a weakening not already set, an interpreter, host or
+looser network policy, a personal, shared or organisation repository that changes, a skill
+added or with another path or pin, and a group or person table removed or changed. So that is
+in view before anyone confirms it; when the settings in force cannot be read, nothing is
+proposed.
+
+So text she reads cannot act through her: an issue body that tells her to change the roster
+can at most make her propose it, in plain view, to a person who decides. Irreversible steps
+keep [green ink](missions.md#green-ink): she cannot sign it, only point you to the Green ink page.
+
+## Her workspace
+
+When the roster gives people personal repositories, Moneypenny keeps her work in that person's
+own repository, so it outlives the conversation and the Station. Her
+[memory](#her-memory) needs none of this. In the global `agents.toml` of a configuration
+directory:
+
+```toml
+[assistant]
+personal_repo = "/srv/moneypenny/{person_digest}.git"   # or {person}
+allow_elevated = false
+allow_beside_local_missions = false
+
+[assistant.shared.ops]          # a directory group
+repo = "ssh://git@git.example/ops/handbook.git"
+write = false
+
+[assistant.org]                 # everyone
+repo = "https://git.example/org/handbook.git"
+```
+
+`{person_digest}` (16 hex digits of the SHA-256 of the person's identifier) works for every
+identifier and is the one to use. `{person}` is the identifier itself, and only when it is 1
+to 64 lowercase letters, digits, `.`, `_`, `@` and `-` not starting with `.`: any other
+identifier is refused, so two people whose identifiers differ only in case never share a
+repository on a case-insensitive filesystem. The template holds exactly one of the two,
+inside the repository's path (not its host or user), and is refused when some identifier
+would fill it in as a shared or the organisation's repository. A local path or `file://`
+repository is created, empty and bare, the first time a conversation or a change uses it, readable by the Station's user only on
+Unix (`0700` directories, `0600` files; on Windows it takes its parent directory's access);
+`ssh://`, `https://` and `user@host:` repositories are reached with the Station user's Git
+credentials and must exist. Universal Exports reads the
+table from the roster it serves (its configuration provider) and sends each message with the person's
+workspace; without `personal_repo` nothing changes from a plain conversation. A Station takes
+no repository on Universal Exports' word: it fills the person's in from its own roster's
+`[assistant]` and refuses a message or commit naming any repository that roster does not give
+that person: a group's shared repository only for a member, by the groups each message and
+each shared commit carries. So the gateway and every Station must read the same roster.
+
+A SQL roster (`sqlite:` or `postgres://`, shared by the Stations of an HA deployment) keeps the
+same keys as one record of kind `assistant`, keyed `settings`, in the table
+`ai6_config_assistant`: the row `settings` holding `{"personal_repo":
+"/srv/moneypenny/{person_digest}.git"}` is the first line above. An administrator with
+`roster.manage` sets it in Outer Office's form (Roster, Moneypenny's settings) or with
+`PUT /v1/user/roster/assistant/settings` (the definition as a
+JSON object, replacing the whole record) or removes it to go back to the defaults, through the
+API or on the app's Roster page under **Moneypenny's settings**. It is
+checked as the table is: an unknown key, a repository AI6 refuses or a record under another key
+is refused with `422` and changes nothing. The answer lists what the record loosens or
+redirects against the settings it replaced (`weakened`, as her proposals word it), and every
+Station logs and reports each setting looser than its default as it takes the change up.
+
+Her workspace on the Station holds:
+
+| Path | What |
+| --- | --- |
+| `personal/` | A clone of the person's repository on `main`: her working directory for them |
+| `shared/<group>/`, `shared/org/` | The repositories of the person's directory groups and the organisation's, cloned afresh at each start, read-only for her |
+| `scratch/` | Anything temporary, gone with the workspace |
+| `CLAUDE.md`, `AGENTS.md` | Where things are |
+
+Claude Code started with `--restricted` does not load a working directory's `CLAUDE.md`, so
+the same text reaches her system prompt through a context file beside the workspace.
+
+After each answer, and when her harness closes, the Station saves her work: whatever she
+changed in `personal/` is committed to `main`, authored by the person (a path with a name
+starting with `.`, such as `.gitattributes`, never is), with
+the message `moneypenny: update <paths>` and the trailer `Via: Moneypenny (conversation
+<id>)`. If `main` moved on meanwhile her commit is replayed on it once; if that conflicts, it
+is pushed to `moneypenny/<conversation digest>` instead and both of you are told.
+
+A change to a shared repository is a proposal, through `propose_shared_change` (the
+group, a file path, its new text and a commit subject), and only for a member of that group;
+anyone else's request is refused. Confirmed, it is committed under the person's name with the
+same trailer. With `write = true` for that group (or for `org`) it is committed at once and
+audited `moneypenny.shared.write`; that setting is a weakening, as are `allow_elevated` and
+any `write = true`, and each is logged when a Station starts or its roster changes.
+
+The change is made from what she read: as the Station sees her call, it reports what the file
+held in her `shared/<group>/` checkout (its SHA-256, or that there was no such file), and
+Universal Exports attaches that to the change. When the repository's `main` has changed the
+file since, the commit is refused and nothing is written, so a group member's edit made
+meanwhile is never replaced; she is told to make the change again from what the file holds
+now. The Station sees the call in Claude Code's stream (the `tool_use` block) and in Codex's
+(the `mcpToolCall` item it announces before calling her server). A call the Station reports
+nothing for within five seconds (her checkout of that repository could not be opened) is
+refused.
+
+## Her memory
+
+Moneypenny remembers each person in rows of the Registry, with nothing to set up: no repository,
+no Station and no clone stand behind it, so she has it on every Station and it survives each of
+them. An entry has an ID (a generated UUID, what every tool and route names it by), a one-line
+summary saying what it is for, an optional name, its content, and who wrote it and when. Names
+and summaries may repeat. Each new harness starts with the newest summaries of hers and then of the
+global memory (what the person may see of it), fenced as data
+(`[assistant.gateway] memory_context_bytes`, 8 KiB, and whatever the job's own bound leaves), and
+she reads what she needs:
+
+| Tool | What it does |
+| --- | --- |
+| `memory_search` | Finds entries by the words in their name, summary or content, best first, in her memory of the person, the global memory and the Operations the person may read, and answers their IDs, names and summaries |
+| `memory_read` | One entry's content and revision, fenced as data |
+| `memory_write` | Keeps something: a new entry, or a change to one that names the revision she read. In her memory of the person at once; in an Operation's or the global [memory](memories.md) a proposal a person who may change it decides |
+| `memory_forget` | Forgets one entry, with its prior versions, at once or as a proposal as a write |
+
+A search counts words, not parts of words, and needs only one of them: entries holding more of
+them rank first, then those holding them in the name or summary, then the newest. It answers the
+same on every Registry, since the database's own index (FTS5 on SQLite, `tsvector` on PostgreSQL,
+a scan on the file Registry) only finds the candidates.
+
+What she keeps of you needs nobody's confirmation, and you see it happen: the conversation shows
+the summary and the diff as it is written. Her conversation is never exposed, but once she has
+read an entry an [exposed Session wrote](memories.md#a-memory-can-carry-an-attack), whatever she
+writes in that conversation carries its mark. A change is refused when the entry has moved on from the
+revision she read (another conversation's change, or your own edit), so nothing written meanwhile
+is lost: she reads it again and makes the change from what it holds now.
+
+## Your memory in the app
+
+What she remembers about you is yours to read and correct. In the app, **Ask Moneypenny**'s
+menu opens **Her memory of you**: your entries with who wrote each, a search, and a form to add,
+edit and forget one (after you confirm). The same page shows the global memory and each
+Operation's you may read ([Memories](memories.md#in-the-app)).
+
+**Export conversation**, in the same menu, saves the conversation as you see it as a Markdown
+file: a heading per entry with who said it and when, and the data of a proposal, view or page as a
+JSON block. In a browser it is a download; on a desktop it is a new file in your Downloads folder,
+never written over another. **Copy** beside each of her answers copies it as she wrote it.
+
+| Route | Does |
+| --- | --- |
+| `GET /v1/user/assistant/memory[?q=TEXT]` | Lists your entries, newest change first, or searches them, best first: `{"person", "entries", "total"}`, with no content |
+| `POST /v1/user/assistant/memory` | Adds an entry: `{"name"?, "summary", "content"}` |
+| `GET /v1/user/assistant/memory/{id}` | One entry with its content |
+| `PUT /v1/user/assistant/memory/{id}` | Changes one: `{"name"?, "summary", "content", "revision"}` |
+| `DELETE /v1/user/assistant/memory/{id}[?revision=N]` | Forgets one, with its prior versions |
+| `GET /v1/user/assistant/memory/{id}/versions` | What it held before, newest first |
+
+An entry holds at most 256 KiB, and your memory 1,024 entries and 8 MiB in all
+([`[registry.limits.memories]`](configuration.md#limits)); up to 8 prior versions of each are
+kept, and forgetting it removes them. A save names the revision that was opened, so an entry she
+changed meanwhile is refused (`409`, with the `revision` it is at) rather than overwritten: open
+it again and make the change from what it holds now. Likewise her next change to an entry you
+edited is refused, and she makes it again from your text. A conversation already running keeps
+what it already read.
+
+Your memory is yours alone. The deployment's administrators can read it, never change it: a
+person holding `assistant.memory.admin` on `config:assistant` ([access
+policy](access.md#the-access-policy)) adds `?person=<id>` to the `GET` routes, and each such read
+is audited `memory.read` before it is made. Without asking by name, another person's entry answers
+exactly as an ID that does not exist, to an administrator as to anyone. Nobody, administrator or
+not, writes or forgets another person's memory. Your own changes and hers are audited
+(`memory.write`, `memory.forget`, naming the entry and the conversation), and one that cannot be
+audited is not made.
+
+## Her scripts and the web
+
+Moneypenny can run small scripts to compute or draft something, and fetch pages from the hosts
+the deployment lists, through Claude Code's own
+[sandbox](https://code.claude.com/docs/en/sandboxing). The roster's `[assistant]` decides
+what she may run and reach:
+
+```toml
+[assistant]
+interpreters = ["python3"]        # the default; [] runs no script
+network = "limited"               # the default; or "denied", or "open"
+allowed_hosts = ["docs.python.org", "*.pypi.org"]   # the default is none
+denied_networks = []              # the default: nothing denied (see below)
+unsandboxed_scripts = false       # the default
+
+[assistant.group.contractors]     # a directory group
+network = "denied"
+denied_networks = ["private"]     # added to the deployment's, never taken from it
+
+[assistant.person."eve@sis"]      # one person
+interpreters = []
+```
+
+A `[assistant.group.<group>]` or `[assistant.person.<id>]` table takes the same keys and may
+only narrow them: fewer interpreters, a stricter network (`denied` before `limited` before
+`open`), fewer hosts, more `denied_networks`, `unsandboxed_scripts = false`. A table that
+would widen one is refused when the roster loads, naming the key (`assistant.group.contractors.network: "open" is looser
+than assistant.network`). Universal Exports works out what each message may use from the
+person's groups and their own table, and every Station caps it by its own roster again, so
+nothing widens on the way.
+
+The sandbox, not the interpreter list, is the boundary: a script runs as the interpreter named
+(`python3 personal/calc.py`), but an interpreter can run any program the sandbox allows (a
+Python script may call `os.system`, and Claude Code's read-only built-ins run), so what keeps
+a script in bounds is where the sandbox lets it read, write and connect, not which tool it is:
+
+- They write in her working directory, `personal/` and `scratch/` among it, but not in
+  `shared/`, `CLAUDE.md`, `AGENTS.md`, or a `.git` directory under the working directory.
+  What they leave in `personal/` is saved after the answer like anything else she writes there.
+- They read nothing outside her working directory but what an interpreter needs: the system's
+  programs and libraries (`/usr`, `/bin`, `/lib`, `/lib64` on Linux; `/usr`, `/bin`,
+  `/System` and the command line tools on macOS), the install directory of each interpreter as
+  found on the harness's `PATH` (`/opt/python3.12` for `/opt/python3.12/bin/python3`), only the
+  files under `/etc` that a program, its resolver and TLS read (`ld.so.*`, `ssl`, `pki`,
+  `localtime`, `hosts`, `resolv.conf`, `nsswitch.conf`, `passwd`, `group` and the like) and the
+  device files `null`, `zero`, `random`, `urandom` and `tty`. Not the rest of `/etc` (so not
+  `/etc/ai6`), `/opt`, `/var` or `/dev`, not the Station user's home, not her own configuration
+  directory or another conversation's, not `/proc`. Reads are denied everywhere and re-opened
+  only for those, and the Station's state, identity and secrets directories, AI6's platform
+  state directory, `/usr/local/etc`, `/usr/etc` and the Station's own program are denied
+  again inside them. Keep the Station's configuration and
+  secrets out of the re-opened paths: an interpreter's install directory is readable whole.
+- They see none of the harness's environment variables but `PATH`, `HOME`, the temporary
+  directory, locale and terminal ones: not the model's key or login, her tool tokens, a proxy
+  URL's basic-auth. A variable whose name is not letters, digits and `_` cannot be hidden, so
+  her harness refuses to start with one in its environment.
+- They reach only `allowed_hosts` under `limited`, nothing under `denied`, and everything the
+  Station reaches under `open`; a host outside what is allowed is refused, never asked about.
+  `denied_networks` takes hosts out of either (below).
+
+Each conversation keeps its own: its own temporary directory, and its own Claude Code
+configuration directory, so one person's transcripts and any stored login never sit where
+another's scripts could reach. Her login must be a token (`CLAUDE_CODE_OAUTH_TOKEN` or an API
+key in the Agent's environment): a shared login directory is not carried into her Sessions.
+Claude Code's own managed settings on the Station still apply to her harness and merge with
+these limits; a Station that has them as files logs it each time her harness starts, since an
+`allowManagedHooksOnly` there would drop the hook that keeps her web fetches to their hosts.
+
+A shell in the interpreter list (`bash`, `sh`, `env`) runs any program the sandbox allows, not
+only the shell, so the Station logs it as a weakening; prefer a single scripting interpreter.
+
+Her web tools follow the same policy. Under `limited` she may fetch pages from the hosts
+listed (`*.example.com` covers every name under `example.com`), and a hook refuses every other
+host, including the documentation sites Claude Code would otherwise fetch without asking.
+Under `denied`, and under `limited` with no host, she has no web tool at all. Under `open` she
+may fetch any page and search the web. Her MCP servers are the harness's own connections and
+need no entry.
+
+Claude Code's sandbox runs on macOS, and on Linux and WSL2 with `bubblewrap` and `socat`
+installed. On native Windows, or a Linux Station without them, she starts without scripts:
+she is told they are unavailable on this Station, and the Station's log says why. A sandbox
+that fails anyway never runs her scripts without it: Claude Code exits as it starts, which
+ends her answer with the reason, or refuses each script.
+
+!!! danger "`unsandboxed_scripts = true` gives every person and every page a shell"
+
+    With `unsandboxed_scripts = true`, a Station whose harness has no sandbox runs her scripts
+    with no limit on what they read, write or reach. Because the model can be steered by any
+    text she reads — a page she fetches, a brief, another Agent's output — this effectively
+    hands every person she serves, and every page she fetches, a shell running as the
+    Station's own user: able to read its credentials, every other conversation and the Station
+    itself. Turn it on only where the Station's user is already confined some other way (a
+    container, a VM). Each harness started under it logs `ai6: weakening: assistant scripts run
+    unsandboxed: …`, and the Station reports it at check-in.
+
+`network = "open"` and `unsandboxed_scripts = true` are weakenings: a Station logs them when it
+starts and reports them at check-in, and `open` is logged again with each harness it starts.
+
+### What `open` reaches, and the deny list
+
+`open` means open: her web tools and scripts reach everything the Station can reach, the
+Station's own machine (its loopback services), its network and the cloud's instance metadata
+service included. AI6 does not know a deployment's network, so it refuses nothing by default;
+its own services do not rely on that, since each one asks every request for its token, from
+loopback too (the Station API, the field runner, the Cable and Theater MCP endpoints, the
+gateway and her MCP endpoint), and the gateway accepts an identity a reverse proxy asserts only
+with the proxy's secret.
+
+What she must not reach goes in `denied_networks`, which applies under `limited` too and which
+a group or person table can add to but never take from:
+
+| Entry | Keeps her from |
+| --- | --- |
+| `loopback` | The Station's own machine: `127.0.0.0/8`, `::1`, `0.0.0.0`, `::`, `localhost` and every name under it |
+| `private` | The private networks: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, CGNAT `100.64.0.0/10`, unique-local `fc00::/7` |
+| `link-local` | `169.254.0.0/16` and `fe80::/10`, the metadata address among them |
+| `metadata` | The cloud instance metadata service: `169.254.169.254`, `fd00:ec2::254`, `metadata.google.internal` |
+| `10.20.0.0/16`, `2001:db8::/32` | A network |
+| `192.0.2.7`, `[2001:db8::7]` | One address |
+| `git.corp.example`, `*.corp.example` | A host, or every name under it |
+
+To keep her off the Station's own services name `loopback`; off the office or data centre
+network, `private` and `link-local`; off the instance's cloud credentials, `metadata`.
+A name is checked as given and by every address it resolves to, an IPv4-mapped IPv6 address
+counting as its IPv4 address, so `localtest.me`, `127.0.0.1.nip.io`, `0x7f.1` and
+`[::ffff:127.0.0.1]` are caught by `loopback`. Her WebFetch hook resolves a name before the
+fetch; a name it cannot resolve while the list holds addresses is refused.
+
+Claude Code's sandbox proxy, which carries her scripts' connections, refuses hosts by name and
+by single address, the addresses a name resolves to included, but not by network (measured with
+Claude Code 2.1.310: `127.0.0.0/8` in its deny list left `127.0.0.2` reachable). So with scripts
+and a network that reaches a host, a deny list holding a network or `loopback`, `private` or
+`link-local` refuses to start her harness, naming the entries; list single addresses and
+names instead (`127.0.0.1`, `0.0.0.0`, `[::1]`, `localhost`), or run no interpreter. The proxy
+itself also refuses a name that resolves to a loopback address and the address `127.0.0.1`.
+On Codex her scripts have no network and she has no web tool, so the list has nothing to keep.
+
+## Her scripts on Codex
+
+On Codex her scripts run in Codex's own sandbox, under a permission profile
+([Codex permissions](https://learn.chatgpt.com/docs/permissions)) the handler passes as
+`ai6_assistant`: the whole filesystem denied, the platform's own paths (`:minimal`) and her
+working directory readable, and only `personal/` and `scratch/` writable (a `.git` under them
+stays read-only). The install directory of the `codex` executable and of each interpreter, as
+found on the harness's `PATH`, is readable too (`/opt/python3.12` for
+`/opt/python3.12/bin/python3`, as for Claude Code), unless that directory is `/`, is or holds
+the home directory, her working directory or a credential directory (`CODEX_HOME`, any
+`*_HOME`), or lies inside a credential directory: an interpreter there is unreachable. Her
+scripts keep only the environment variables Claude Code's keep
+(`shell_environment_policy.include_only`). On Windows the handler sets `windows.sandbox =
+"mxc"`, the one Windows implementation that denies reads; `unelevated` refuses such a
+profile and `elevated` needs the whole filesystem readable (Codex 0.164).
+
+Codex's `:minimal` is wider than Claude Code's system paths: with Codex 0.164 it re-opens all
+of `/etc`, `/usr`, `/dev`, `/proc` and `/run` on Linux, and `C:\Windows`, `C:\Program Files`
+and `C:\ProgramData` on Windows. So the handler denies the Station's own paths again inside
+it: `/etc/ai6`, `/usr/local/etc` and `/usr/etc` (not on Windows), the Station's state,
+identity and secrets directories, AI6's platform state directory, and the directory of the
+Station's own program (or only the program, when an
+interpreter's install directory holds it). Keep the Station's configuration and secrets in
+one of those, or outside what `:minimal` opens: elsewhere under `/etc` or `C:\ProgramData`
+her scripts can read what the Station's user can.
+
+Codex merges its user's own `config.toml` into these settings: a `[permissions.ai6_assistant]`
+table there would add to the profile (with Codex 0.164, `network.enabled = true` in it gave
+her scripts the network), and `shell_environment_policy.set` would change the variables they
+keep. So before her thread starts or resumes, the handler reads Codex's effective
+configuration (`config/read`) and the thread's own (`thread/start`), and refuses to start her
+unless the profile, its choice as the default and the environment policy are exactly what it
+passed and the thread runs in that profile without network. The refusal names the setting;
+remove it from the Codex configuration of the Station's user (or its managed configuration).
+
+What differs from Claude Code:
+
+- **Any command, not only the interpreters.** Codex 0.164 offers the model only its code-mode
+  tools, `functions.exec` (JavaScript that calls her server's tools and the command tools) and
+  `functions.wait`, and keeps no list of allowed programs: inside the sandbox she may run any
+  command. Each harness started with scripts reports that as a weakening (`ai6: weakening:
+  Codex gives Moneypenny's thread functions.exec and functions.wait …`, and a `weakened`
+  event first). The tool check reads the tools `exec` declares and admits only the command
+  tools, Codex's patch tool when she has files to write, her servers' tools and resource
+  tools, and a clock; anything else stops her start (`AI6_CODEX_TOOL_CHECK=warn` starts it as a
+  weakening). Codex 0.164 always declares the patch tool, so there she needs `files` to start
+  with interpreters.
+- **No network for scripts.** Codex's app server enforced no host list for a profile's
+  network in Codex 0.164 (with network on, a script reached unlisted hosts and the Station's
+  own loopback services), so her scripts get none under every policy; she is told so when the
+  policy names hosts, and the Station logs it. She has no web search on Codex.
+- **Files only through scripts.** Codex has no file tool outside `exec`: without interpreters
+  she writes nothing, and is told so.
+- **Links do not lead out.** A script may create a link in `personal/` pointing outside her
+  working directory (a symbolic link on Linux and Windows; MXC refused a junction), but neither
+  a script nor Codex's patch tool reached its target with Codex 0.164: the patch tool runs
+  inside the same sandbox, so a write through the link failed and the target was unchanged.
+
+Whether Codex's sandbox runs is asked once in 15 minutes per executable and configuration:
+the handler runs `codex sandbox -P` with the same kind of profile, no model involved. Where it
+fails (Windows without MXC, a Linux host that refuses bubblewrap), she starts without scripts,
+as on a Station where Claude Code has no sandbox, unless `unsandboxed_scripts = true`: then
+Codex runs her commands with no sandbox (`danger-full-access`), the weakening above.
+
+## Her skills
+
+Moneypenny can use [Claude Code skills](https://code.claude.com/docs/en/skills), but only
+those of a catalog in the global `agents.toml`, each pinned to the exact files it was
+reviewed with:
+
+```toml
+[assistant.skills.report-writer]
+path = "skills/report-writer"     # absolute, or relative to this configuration directory
+pin = "sha256:..."                # ai6 assistant pin-skill skills/report-writer
+
+[assistant.group.contractors]     # a directory group
+skills = []
+
+[assistant.person."eve@sis"]      # one person
+skills = ["report-writer"]
+```
+
+`ai6 assistant pin-skill DIR` prints every file of the skill directory with its SHA-256 and
+the `pin`: the digest of one line per file, path and digest, the same tree digest an
+[overlay](agents.md#overlays)'s pin is, so `.git`, `node_modules` and the other names AOS excludes
+are not part of it. Change any byte, add or remove a file, and the pin does not match. Everyone is given every catalog skill; a group's table,
+and a person's, may leave some out, never add one, and a person in several groups keeps only
+what all of their tables keep. These are the same tables that narrow [her scripts and the
+web](#her-scripts-and-the-web): one table may set `skills` beside `interpreters` or `network`.
+
+When the roster loads, each skill's `SKILL.md` is read and the load fails, naming the skill,
+when:
+
+- it has no `pin` (unless `skills_unpinned = true`);
+- its front matter is not YAML between two `---` lines, or does not have `name` equal to the
+  catalog's name and a `description`;
+- its front matter has any key but `name`, `description`, `when_to_use`, `argument-hint`,
+  `arguments`, `disable-model-invocation`, `user-invocable`, `disallowed-tools`, `paths`,
+  `metadata`, `license` and `compatibility`, or it injects a command (`` !`command` ``, or a
+  block opened with `` ```! ``), unless `skills_allow_tools = true`. `allowed-tools` grants
+  tools without asking for the turn that loads the skill, `hooks` registers commands for the
+  rest of the Session, an injected command runs before she reads the skill, and `model`,
+  `effort` or `context` change her Session, so none of these loads by default.
+
+`skills_unpinned` and `skills_allow_tools` are weakenings, logged and reported at check-in as
+`allow_elevated` is, and so is a SHA-1 pin. The skill directories must be readable wherever
+the roster is loaded: by every Station and by Universal Exports. A SQL roster gives absolute
+paths.
+
+With each message Universal Exports sends the skills the person is given, with the person's
+directory groups. The Station takes only names its own roster gives that person (its catalog,
+less what its own group and person tables leave out), as it caps her scripts and network, and
+restarts her harness when anything it started under changes: her skills, a skill's path or
+pin in its catalog, `skills_allow_tools` or `skills_unpinned`, her scripts and network, her
+repositories (a group she left takes its `shared/` checkout with it) or her tool token. Before her harness starts it copies each skill into
+her working directory's `.claude/skills/<name>/`, never through a link, then checks the copy
+against its pin and its `SKILL.md` again. A skill that does not match is left out: the
+Station logs `ai6: assistant skill <name> does not match its pin` (or why else it was not
+installed), files a `provider` finding in its logbook, and the conversation is told. Her
+standing text lists the skills she has. She cannot write there: no path with a name
+starting with `.` is hers to write, and her scripts' sandbox denies writes to `.claude`.
+
+Claude Code started with `--restricted` loads no skill from the working directory, the
+user's own `~/.claude/skills` or an installed plugin, so the Station hands the directory to
+it as a plugin named `ai6` (`--plugin-dir`): she calls a skill as `ai6:<name>`, gets the
+`Skill` tool only when she has skills, and has no other skill to call. Injected commands are
+replaced with a notice (`disableSkillShellExecution`) unless `skills_allow_tools` is set; with
+it, they still go through her permission rules. A skill's other files she reads with her
+file tools, which she has with a [workspace](#her-workspace). Skill text is the
+deployment's own, like a shared repository: reading it exposes nothing. Codex keeps no list
+of allowed skills (it loads those of the project, the user's home directory and the system,
+and its own bundled ones: [Codex skills](https://learn.chatgpt.com/docs/build-skills)), so on
+Codex the Station installs none, tells
+her skills are unavailable and logs why; a person who needs skills runs on Claude Code.
+
+## Cables
+
+She can talk to Agents for you over [Cables](agents.md#cables), in the Operations where you
+may: `cable.send` on `operation:<id>` lets her send and reply there, `cable.read` lets her
+read the Cables sent to her there ([access policy](access.md#the-access-policy)). With
+neither anywhere she has no Cable tools at all. Universal Exports works out those Operations
+with each message you send, and the Station asks it again before every Cable call, so a
+permission taken away holds from her next call; when Universal Exports does not answer, the
+call is refused. A [compartment](compartments.md#people) that gives you `cable.send` or `cable.read`
+counts; her Cables stay per Operation, and she has no audience of a whole compartment.
+
+The Station running her gives her a second MCP server, `cables`, with `discover_agents`,
+`send_cable`, `read_cables`, `acknowledge_cable` and `reply_to_cable`; every call names an
+Operation, and one outside your permissions is refused exactly as an unknown target is. Its
+token expires with the token of her own tools, and the Station starts her again with new ones
+before the next message after that; a turn already running keeps it until it ends or you stop it.
+Recipients see the Cable as from her **for you** (`moneypenny for <your person
+ID>`), and only Agents of the Operation it is sent in can get it. Your permissions are not
+enough on their own: the Station's `cables.toml` must also let her Agent send and receive,
+and its quotas and fan-out limits apply to her as to any Agent, except that the sender quota
+is counted for each person she acts for:
+
+```toml
+# cables.toml
+[[grants]]
+agent = "moneypenny"
+action = "send"
+scope = "station"
+name = "hq"
+
+[[grants]]
+agent = "moneypenny"
+action = "receive"
+scope = "station"
+name = "hq"
+```
+
+One Agent is Moneypenny for everyone, so her conversations are never an audience: a Cable to
+the Agent `moneypenny`, to a Station, a Theater, a channel or everyone does not reach any of
+them. Only a reply to one of her Cables reaches her, and only the conversation that sent it,
+never your other conversations or another person's. She reads only the Cables of the
+Operation she names; the others stay unread.
+
+Every Cable she sends or replies with waits for you, whatever she has read, because a Cable
+reaches other people and Agents. The Station
+holds the Cable and the chat shows it as a proposal with the Operation, the recipient, how
+long it lasts and the exact text, needing `cable.send`. Universal Exports checks that what it
+shows is what the Station holds (a digest of all of it) and shows nothing otherwise. Confirm,
+and your permission is checked again, the confirmation is audited (`moneypenny.confirmed`),
+and the Station holding it sends it if it hears within the answer timeout (a minute by
+default); otherwise the proposal fails and nothing is sent. Cancel, or leave it for an hour,
+and nothing is sent. A held Cable lives in that Station's memory, apart from her harness: it waits its
+hour whether or not her session there stays open, and goes on waiting when she starts again. A Station
+restart drops it, and confirming it then fails and says why. A body with a character that renders as
+nothing is refused before it can become a proposal. With 32 Cables already held, or 32
+proposals waiting, she is told so and the new one is refused; nothing waiting for you is
+dropped to make room.
+
+Every Cable sent for you is recorded twice in the audit log: by the Station's relay before the
+Cable is stored (action `cable.send`, you as actor, her Agent and the audience in the target;
+refusals too), and a Cable whose record cannot be written is not sent; then by Universal
+Exports (`moneypenny.cable.sent`, you as actor, the conversation and the Cable).
+
+## What she reads, and what that gives up
+
+Exposure is for [a Mission's Session](medical.md#exposure), an Agent doing work. A conversation
+with Moneypenny carries no such mark: nothing she reads sets one, and nothing she does is
+restricted or framed because of what she read. Her tool results still reach her inside
+`<ai6-data>`, which tells her they are data, and a Cable from her does not mark the Session that
+reads it.
+
+What this gives up, plainly:
+
+- **Text she reads can steer her, with nothing to show it happened.** A brief, an Agent's output,
+  an issue, a web page or a Cable can hold instructions. The framing tells her not to follow
+  them; nothing checks that she did not.
+- **Her memory is written without asking you.** Such text can persist into your later
+  conversations. The diff shows in the chat as it is kept, and you can
+  [edit her memory](#your-memory-in-the-app) afterwards; nothing stops it first.
+- **Her pages and offered links carry no warning.** A page, a view or a card she made after
+  reading such text looks like any other. With **Open Moneypenny's links at once** on, a page she
+  offers opens on its own (it only reads).
+- **Your confirmation is the one control on what she does.** Her proposals and her Cables wait for
+  you. Read what you confirm: it may have been written for you to confirm. A group's
+  `write = true` lets a shared change through without you.
+
+What keeps it narrower, for a deployer: the
+[network policy](#her-scripts-and-the-web) decides what she can fetch and where her scripts reach;
+`[assistant.pages]` `network` and `feeds` bound her pages; and her tools can never do more than
+the person using her may.
+
+## Views she shows
+
+When a table or a chart says it better than prose, she shows a **view** with her `show` tool.
+A view is data in a strict, versioned schema that the app renders with its own widgets:
+
+| Block | Shows |
+| --- | --- |
+| `text` | Markdown: headings, lists, bold, italic, code, and links to app pages only |
+| `table` | Columns and rows of plain values |
+| `key_values` | A list of names and values |
+| `chart` | A bar (side by side or `stacked`), line or pie chart of up to eight series; a pie is one series of up to twelve slices, none below 0 |
+| `schedule` | Bars over time, one row each from `start` to `end` (RFC 3339 times or numbers), coloured by state, each optionally opening an app page (a route link) |
+| `graph` | Nodes (Operations, Stations, Theaters, Missions, Sessions, Agents) and the edges between them, in layers or as a tree; a node may open an app page |
+| `svg` | A drawing in SVG, with a title |
+| `card` | A Mission, Station or Theater, opening its page |
+| `timeline` | Dated events |
+| `diff` | Two texts, line by line |
+| `form` | A draft of one of her `propose_*` tools for the person to fill in |
+
+Nothing in a view runs: there is no HTML, no script and no outside link. Universal Exports
+refuses a view that is not exactly the schema, within its bounds, and tells her why, so the
+app never receives it; the app checks again and shows a refused view as "View refused" with
+the reason, never as a guess. Submitting a form records a proposal of its tool, which the
+person still confirms. Every chart, schedule and graph has **Show as table**, which shows the
+same values in a table, and a summary for screen readers.
+
+An SVG drawing holds drawing elements (`svg`, `g`, `defs`, `title`, `desc`, `path`, `rect`,
+`circle`, `ellipse`, `line`, `polyline`, `polygon`, `text`, `tspan`, `linearGradient`,
+`radialGradient`, `stop`, `clipPath`), their geometry and presentation attributes and `id`,
+and nothing else; `url(#id)` may name only an `id` of the same drawing. It needs a `viewBox`
+and a `<title>`. A script, style, event attribute (`onload` and the like), `href`, `image`,
+`foreignObject`, `use`, link, animation, filter, DOCTYPE, entity or processing instruction is
+refused with the reason, never removed, so she fixes the drawing herself. Universal Exports
+keeps the drawing written out again from what it accepted, and the app draws that text in the
+theme's colours (`currentColor` is the text colour), at most 480 pixels high; it loads
+nothing.
+
+Her `missions` tool filters exactly as the Missions page does (both are held to one shared
+set of cases): by Operation; by a Mission's state, that of the Session updated last (a Session that
+reported none is working); then by the Station or Agent of any of its Sessions and by text in the
+Operation, Mission, Session IDs or brief, in any case.
+
+The bounds are settings, `[assistant.views]` in the global `agents.toml` (the `views` table of
+the `assistant` record), each at least 1; Universal Exports reads them when it starts:
+
+<!-- schema:record.assistant.views:begin -->
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `blocks` | 24 | Blocks in one view. |
+| `view_bytes` | 64 KiB | **Size of one view.** Bytes of one view as JSON. |
+| `text_bytes` | 8 KiB | **Size of a text block.** Bytes of a text block's Markdown. |
+| `short_bytes` | 512 | **Size of a title, label or cell.** Bytes of a title, label, cell or other short text. |
+| `columns` | 12 | Columns of a table. |
+| `rows` | 200 | Rows of a table. |
+| `items` | 100 | **Items of a list or timeline.** Items of a key-value list or a timeline. |
+| `series` | 8 | Series of a chart. |
+| `points` | 200 | Points of one series. |
+| `pie_slices` | 12 | Slices of a pie. |
+| `diff_bytes` | 16 KiB | **Size of each side of a diff.** Bytes of each side of a diff. |
+| `fields` | 20 | **Fields of a form or card.** Fields of a form or a card. |
+| `schedule_rows` | 50 | Rows of a schedule. |
+| `graph_nodes` | 60 | Nodes of a graph. |
+| `graph_edges` | 120 | Edges of a graph. |
+| `svg_bytes` | 32 KiB | **Size of a drawing.** Bytes of an SVG drawing. |
+| `svg_elements` | 2,000 | **Elements of a drawing.** Elements of an SVG drawing. |
+| `svg_depth` | 16 | **Nesting of a drawing.** How deep an SVG drawing nests its elements. |
+| `navigate_label_bytes` | 120 | **Size of a page link's label.** Bytes of the label of a page she offers with `navigate`. |
+| `svg_id_bytes` | 64 | **Size of an id in a drawing.** Bytes of an `id` in an SVG drawing. |
+<!-- schema:record.assistant.views:end -->
+
+```toml
+[assistant.views]
+graph_nodes = 100
+svg_bytes = 65536
+```
+
+The app is sent the bounds with each conversation and checks views against the same values.
+
+## Pages she points to
+
+When a page of the app answers better than a table, such as "the failed Missions of G", she
+offers it with her `navigate` tool: `{"to": ROUTE, "label": TEXT}`, the route in its JSON form
+(`{"page": "missions", "operation_id": "G", "state": ["failed"]}`) and a few words on why
+(at most `navigate_label_bytes`, 120 by default). Universal Exports checks the route as it checks every
+route and refuses one that is not valid with the reason ("Navigation refused: …"), so the
+app never receives it. A valid one is a card in the chat: the page's name and every field of
+the route as chips, which the app builds from the route itself, her label beneath, and
+**Open**. Her summaries of records offer the route of what she summarised, and say when a
+tool refused or cut what she could read.
+
+A route names a page and its filters and nothing else: no action, dialog or form value, and
+pages open a selection read only. Opening one only reads, so it is not audited (her `show`
+is not either); the conversation records it. A filtered page always shows its filters as
+chips with **Clear filters**, so nothing a route sets is hidden.
+
+**Open** takes the page in the window: a new browser history entry, so Back returns to the
+page before; an expanded chat docks, and one over the page (a sheet, or full screen on a
+phone) closes, so the page is in view; the page shows **Opened by Moneypenny** until the
+route changes. Her links in text, schedules, graphs and cards open pages the same way.
+
+By default nothing opens until the person chooses **Open**. **Open Moneypenny's links at
+once**, in her menu, opens each card as it arrives instead; it is the person's own choice,
+kept on each device, and off unless they turn it on. Even then a card waits for **Open**
+when she offered it after reading text from outside AI6 (it is framed like such a view),
+or while a dialog covers the page.
+
+Her `audit` tool takes an Operation or a Station, not both, as the Audit page does.
+
+## Pages she publishes
+
+`publish_page` makes a page you open in a browser tab outside the app, never inside it. It is
+a **dashboard** (reads live data through `feeds`), a **report** (a snapshot of data she put in
+the files, made when you ask for one) or a **file** (one log, CSV, Markdown or image). She gives
+a `path` (a file or directory under `personal/` or `scratch/`, which the Station uploads; a
+bundle's entry is `index.html`) or inline `content` of a `format` (html, markdown, text, csv,
+json, svg, up to 192 KiB). Markdown is rendered; text, CSV and JSON are shown as text; scripts,
+styles and images of a bundle load as they are; anything else (a PDF included) downloads.
+`replace` keeps a page's id. `unpublish_page` deletes one; `pages` lists yours.
+
+A page is kept for a day unless you **Remember** it, counts toward quotas
+(`[assistant.pages]`, [Moneypenny's limits](configuration.md#moneypennys-limits)) and is audited
+(`moneypenny.page.published`, `.opened`, `.handoff`, `.handoff_used`, `.remembered`, `.forgotten`, `.shared`, `.public`,
+`.deleted`, `.expired`). A page is private: only you, and whoever you share it with, can ask for
+a link to it. Another person, an administrator included, gets 404 from `POST
+/v1/user/pages/{id}/open`, exactly as for a page that does not exist.
+
+**Share** (the card's menu, `PUT /v1/user/pages/{id}/shares {subjects}`, `ai6ctl pages share ID
+SUBJECT...`) names whom it reaches, in place of whom it reached: `person:ID`, `group:NAME` or
+`account:NAME`, `compartment:ID` (the people read into it; only one you are read into) or
+`operation:ID` (the people who hold `mission.read` there, compartments and parent Operations
+included; only one where you do). An empty list shares it with nobody. A viewer's feeds run with
+that viewer's own permissions, so they see only what they may read; a report shows what you
+could read when she made it, to everyone it reaches. A viewer no share names any longer loses
+their page at their next request, as does one read out of the compartment or losing `mission.read`. Only you
+change its shares, remember, forget or delete it; the bar tells a viewer it was shared by you.
+**Her pages**, in her chat's menu, lists your pages and then those shared with you. An
+administrator turns sharing off with `[assistant.pages] sharing = false`, and existing shares then
+grant nothing; `max_shares` (32) bounds the subjects of one page.
+
+**The link to give someone is the app's**: `https://APP/#/pages?page_id=ID` (the Share dialog
+copies it) opens Her pages on that page once they sign in, and they open it from there; anyone
+the page is hidden from is told there is no such page.
+
+**A page has an address of its own**, `{pages base}/p/{id}/`, which the app opens in a browser
+tab and which works by itself too: a bookmark, a new tab, a reload, a link from another site, the
+same address on another of your devices. Every request under it, the frame, the page's files and
+its feeds alike, names who is asking and is checked against the page at that moment; anyone the
+page is hidden from, and anyone it cannot name, gets what a page that does not exist gets (404).
+Who is asking is named by, in order:
+
+- the gateway's **page authenticator**, the `unex` record's `page_authenticator` with its
+  `page_authenticator_config`: `coqui_access_mtls` when the gateway serves TLS itself and the
+  browser holds a client certificate (`[unex.tls]` in `ai6.cfg`), or `coqui_access_proxy` behind
+  a front door that verified a certificate or signed someone in and says so in a header it sets,
+  trusted only from the proxy's own addresses (see [Access](access.md#pages-by-themselves));
+- else the **page cookie**, `ai6_pages`, which signing in from a browser sets for the pages' path:
+  `HttpOnly`, `Secure`, `SameSite=None`, `Path=/pages/`, naming that sign-in by its ID and a mark
+  only this gateway's pages directory can make. Each request checks the sign-in still stands, so
+  signing out, or the sign-in running out, ends it at once, and the browser is told to drop it at
+  sign-out. A browser whose sign-in has ended is told so (`403`, "You are signed out"). The
+  app's renewals and a reload's resume set it again.
+
+**A browser with no page cookie** gets one from the app. The desktop app, `ai6ctl pages open`, and
+the web app where pages have an origin of their own (a sign-in at the app cannot set the cookie
+there) open a page by asking `POST /v1/user/pages/{id}/open`, which makes a **hand-off**: a token
+in the address (`?handoff=`) that works once, for `[assistant.pages] handoff_ttl` (30 seconds), for
+that page and your sign-in. The browser's first navigation there spends it, sets the page cookie
+and is sent on to the clean address, so the token leaves the address bar and a bookmark or a reload
+works from then on. A second use, one that has run out, one for another page or for a sign-in that
+has ended answers as a page that does not exist. Making one is audited
+(`moneypenny.page.handoff`), as is using one (`moneypenny.page.handoff_used`). They are held in
+memory, so a restart ends those not yet used, and a person holds at most `handoffs` (16) at once.
+The web app on the API's own origin needs none, and opens the plain address (`{"handoff": false}`).
+
+None of these counts under `/v1`: the API keeps its bearer token, and a request carrying only a
+certificate, a front door's header or the page cookie is refused there (`401`), so a page's own
+scripts, which run with them, cannot act as you.
+
+The cookie is `SameSite=None` because of what browsers send for a sandboxed page, measured in
+Chrome and Edge: the page's own scripts, styles, images and fetches come from an opaque origin,
+and carry a `SameSite=None` cookie and nothing stricter, so a `Lax` cookie would leave a page
+without its own files. Another site's requests for the same addresses carry it too, so the
+page's files and feeds also sit under a **view token** the frame names for that viewer and that
+opening (`{pages base}/p/{id}/{token}/f/…`): a keyed mark of the page, the viewer, the network and
+when it ends (`open_ttl`, an hour), never in an address bar. It opens nothing by itself, and
+another site, which cannot read the frame, does not know it. A page's script fetches its feeds,
+and any of its own files, with `fetch(url, {credentials: "include"})`: without its credentials
+a fetch from an opaque origin sends no cookie. `?network=none` (or `own`) on the address opens it
+with a tighter network.
+
+The key of the view tokens and page cookies is `.key` in `ai6.cfg`'s `[unex.pages] dir` (by
+default `pages` in the gateway's state directory, which the gateway names at start), so a
+restart of the gateway keeps every open page and every cookie working. A refusal the person
+could not see the reason for is logged once for each page and viewer: a file or feed the page
+does not have, a view token that is not theirs or has run out, a viewer who may no longer read
+the page.
+
+Opening shows the gateway's **classification bar** over the page: "Made by Moneypenny for you,
+not part of Outer Office", the title, kind and expiry. The close control hides the bar for that
+view; a reload shows it again. `[assistant.pages] frame = false` drops the bar; the page still
+runs in the gateway's frame, which names its view token, and a page's file
+asked for on its own is sent to the frame.
+
+A **public link** is your choice (the card's menu, `PUT /v1/user/pages/{id}/public {on}`,
+`ai6ctl pages public ID on|off`): `{pages base}/s/{token}/` opens the page for anyone holding
+it, with no sign-in, until you turn it off or the page goes. Turning it on again keeps the same
+link, and a page she replaces keeps it, audited again. It serves **no feeds**, since a public
+viewer has no permissions to read with, and its bar says it is public and does not name you.
+The app asks before it turns one on. `[assistant.pages] public = false` lets nobody make one and
+stops every one there is. On the API's own origin (no `[unex.pages] origin`) a gateway with
+public links allowed reports it as a weakening at start: an outsider then sees a page she made
+under the app's address.
+
+Pages are open by default: scripts run and they may fetch from anywhere, because a dashboard
+may need a chart library or an API. What they cannot do is act as the app. Every response
+carries `Content-Security-Policy: sandbox ...` without `allow-same-origin`, so the page is an
+opaque origin that reads no cookie, storage or sign-in of its host, `/v1` answers it no CORS header,
+and it cannot navigate the top window. Dashboards read **live** data: each feed is a read tool
+with input fixed at publish, run when the page asks for `data/NAME` (from a file at the top
+of the page, such as its `index.html`) as the page's viewer, so a viewer sees only what their own
+permissions allow and a revoked grant applies at once. A bundle with a top-level `data/`
+directory is refused, so no file can stand in for a feed.
+Feeds read; they never propose or send. Options, set by an administrator for everyone:
+`scripts = false`, `network = "own"` (its own files and feeds) or `"none"` (its own files), `feeds
+= false`, and a separate origin for pages (`ai6.cfg`'s `[unex.pages] origin`). You may also open one
+page with the network off.
+
+The remaining risk, plainly: a dashboard she made after reading text someone else wrote can be
+steered to read, through its declared feeds, whatever its viewer may read, and send it anywhere
+for as long as the page is open, and nothing on the page says what she read. Feeds are read-only
+and fixed at publish, so it can neither change anything nor read past them. `network`, `feeds`
+and opening with the network off are the tighter options. On the API's own origin the address
+bar shows the app's host, so a page can draw a faithful sign-in: a separate origin removes that
+and a proxy that strips the sandbox header.
+
+## In the app
+
+With `assistant = false` in the `unex` record she is not served: the profile says so
+(`moneypenny: false`), the app offers no card, button or chat for her, and its Settings say she is
+off and who can change that. Otherwise **Ask Moneypenny** (top right on every page, or Ctrl+Alt+I;
+⌃⌘I on macOS) opens the chat:
+beside the page in a wide window, over it in a narrower one, full screen on a phone. It can
+be expanded into the centre (Ctrl+Alt+Shift+I) and, on desktop, popped out into its own
+window (Ctrl+Alt+O); every layout shows the same conversation, and the app remembers the
+layout per person on each device (the app's README has the details). The app's demo build
+(`OO_DEMO=true`) shows a scripted sample conversation instead, labelled as one; it reaches no
+network and its proposals change nothing.
+
+The app opens a WebSocket to `/v1/user/moneypenny` and sends its access token in the first
+frame. With each message it sends the page the person is on and its filters, as the page's
+route (for example `app:/missions?operation_id=G&state=failed`), so "why is this one stuck?"
+means something. Her links and page cards open app pages the same way
+([Pages she points to](#pages-she-points-to)). Her answers, the tools she used, her
+views and her proposals (with **Confirm** and **Cancel**) appear in the chat.
+Conversations are kept per person (20 each, for a week) in Universal Exports' memory;
+reopening one shows what was said, and with a Registry a conversation the gateway no longer holds
+(after a restart) is read back from [her conversation log](#her-conversation-log). One message is
+answered at a time.
+
+While she answers, **Stop** takes the place of Send. It sends `{"type":"interrupt"}` on the
+socket, which only ever reaches the person's own conversation. A message no Station has
+taken up yet is simply withdrawn (a Station that was just starting on it shows nothing of
+that answer and closes her harness, which from the Stop on has no tools and no Cables; a
+Cable it sent before is still recorded in the audit log); otherwise Universal Exports asks the Station running her
+harness to interrupt it, and that Station's handler stops the turn the way the harness
+expects (a stream-json interrupt request for Claude Code, `turn/interrupt` for Codex). The
+conversation then shows "You stopped Moneypenny's answer.", her harness stays up for the next
+message, and she is told with that message that she was stopped. Stop with nothing being
+answered does nothing.
+
+**Images.** In a browser, a screenshot pasted anywhere in the app, or picked with **Add an
+image**, goes with the next message: PNG, JPEG, WebP or GIF, told apart by their bytes, at most
+`[assistant.limits] images` (4) of at most `image_bytes` (5 MiB) each. The composer shows them
+as thumbnails, each with a control that takes it away. The desktop app has no clipboard or file
+picker for images. The message frame carries them as `images: [{media_type, data}]`, base64;
+Universal Exports checks each, keeps it once per person by its SHA-256 beside the pages
+(`.images/` in `[unex.pages] dir`, for as long as her conversation log keeps the message), and
+names it by digest in the conversation (`data.images` of the person's entry) and in the job. The
+Station reads the bytes (`GET /v1/station/assistant/images/{sha256}`, for a conversation it
+runs) and gives them to a harness whose handler takes images, in the same turn as the text; the
+Claude handler sends each as an image block. A handler that takes none (Codex, Antigravity CLI,
+an `acp` agent) refuses the message and says why. Any image in the conversation, the person's
+or one of her drawings, opens enlarged on a click, where it pans and zooms; the person's are
+read back with `GET /v1/user/moneypenny/images/{sha256}`, which answers only them.
+
+## Her conversation log
+
+With a Registry, Universal Exports keeps every entry of every conversation for good, as it
+arrives: what the person wrote, her text, the tools she named, her views, proposals (and each
+change of their status), navigation and page cards, notices and errors. Beside them the log keeps
+what the app never shows: each tool call she made, with its arguments (`tool_call`), and the size,
+status and time of its answer (`tool_result`). Each entry that came from her harness or her tools
+names the turn that ran it: the Station, the provider Session, the Agent, the route (with its
+pool), the pool account the harness held, the model, and the tokens the harness reported. A
+failed turn that leaves nothing in either service's journal is in the log, with where it ran.
+
+Text is kept as it was sent, since that is what an audit needs. Secrets do not reach the log:
+the person's access token and her tool token are no part of an entry, and wherever either
+appears in text or arguments it is replaced with `[redacted]`. A writer of its own stores
+entries in order, so a conversation never waits on the Registry. It keeps 90 days and 1 GiB in
+all (`[assistant.gateway] log_age`, `log_bytes`; `none` keeps everything), trimmed every hour
+(`log_prune_every`); an entry past `[registry.limits.assistant_log] entry_bytes` (1 MiB) is kept
+without its data, its text cut, and says how large it was. A stopping gateway (Ctrl-C, or SIGTERM
+on unix) waits up to 10 seconds (`log_flush_timeout`; `none` waits for all of it) for what is
+still queued, and logs how many entries were left if it gives up.
+
+A conversation the gateway no longer holds is rebuilt from the log when its person opens it:
+what the app shows, within the usual bounds, and the Station, provider Session and route of its
+last turn, so the next message resumes there. A proposal that was still waiting shows as expired.
+
+Each Session of hers also has its [context](missions.md#session-context): her harness's own
+record of the Session, filed by the Station after each turn and when the harness closes.
+
+- `GET /v1/user/assistant/conversations` lists the person's own conversations in the log
+  (`{"conversations": [{conversation, person, first_at, last_at, entries, bytes}]}`, newest
+  first); `?person=ID` lists another person's and `?everyone=true` everyone's.
+- `GET /v1/user/assistant/conversations/{id}/log` answers `{conversation, person, entries}`.
+- `GET /v1/user/assistant/conversations/{id}/context` answers `{conversation, person, contexts}`,
+  each context as [the Session context route](missions.md#session-context) gives it.
+
+A person reads their own freely. Another person's needs `audit.read` and `session.context` on
+`config:assistant`, and each read is audited before anything is read (`assistant.log.list`,
+`assistant.log.read`, `assistant.context.read`, resource `config:assistant`, target the person
+and the conversation). Without them another person's conversation answers `404`, as one that is
+not there does.
+
+In the app, her menu's **Conversation log** shows the conversation open in the chat as the log
+keeps it, each entry with the turn that ran it and each tool call folded, and its Context tab
+shows her harnesses' contexts. **Logged conversations** lists the person's own, or another
+person's or everyone's for someone who holds both actions.
+
+## Settings
+
+| Setting | Default | Where |
+| --- | --- | --- |
+| The Agent she is | `moneypenny` | the `unex` record's `assistant_agent` ([Configuration](configuration.md)) |
+| Serve her at all | yes | the `unex` record's `assistant` |
+| The bounds of her views | [Views she shows](#views-she-shows) | `[assistant.views]` |
+| What a job and a report may hold | 32 KiB a message, 64 events a report, and so on | `[assistant.limits]` ([Moneypenny's limits](configuration.md#moneypennys-limits)) |
+| Conversations kept | 20 a person, 2,000 in all, 7 days | `[assistant.gateway]` `conversations_per_person`, `conversations`, `conversation_age` |
+| Tool token lifetime | 1 hour, and past it for a turn already running while its Station is heard from | `[assistant.gateway] token_ttl` |
+| Time for a Station to take a message | 60 seconds | `[assistant.gateway] answer_timeout` |
+| Tool calls per conversation | 120 a minute | `[assistant.gateway] tool_calls_per_minute` |
+| Conversations of one person with a running harness or an answer pending | 2 (the least recently used idle harness is closed to make room) | `[assistant.gateway] live_per_person` |
+| How long an answer may go without word from its Station | 10 minutes, then it is given up | `[assistant.gateway] answer_deadline` |
+| Conversations' size | 1 MiB per conversation, 4 MiB per person (oldest views go first); the app is sent the newest 100 entries | `[assistant.gateway]` `conversation_bytes`, `person_bytes`, `ready_entries` |
+| Her conversation log | 90 days and 1 GiB in all, trimmed every hour; 1 MiB an entry | `[assistant.gateway]` `log_age`, `log_bytes`, `log_prune_every`; `[registry.limits.assistant_log] entry_bytes` |
+| Her Sessions' contexts | 8 MiB each, its newest part kept; 2,000 kept | `[registry.limits.contexts]` `context_bytes`, `records` |
+| Her memory | 256 KiB an entry, 1,024 entries and 8 MiB a person, 8 prior versions, 50 entries a search | `[registry.limits.memories]` ([Configuration](configuration.md#limits)) |
+| Her memory's summaries in a new harness | 8 KiB, and no more than the job's context leaves | `[assistant.gateway] memory_context_bytes` |
+| Assistant Sessions on one Station | 4 running or starting; closed after 10 idle minutes | `[assistant.desk]` `live`, `idle` |
+| A clone of one of her repositories | 120 seconds and 512 MiB, then given up and removed | `[assistant.desk]` `clone_timeout`, `clone_bytes` |
+| What one save of her work commits | 16 MiB; past it nothing is saved and she is told | `[assistant.desk] save_bytes` |
+| Personal repositories | none: no workspace | `[assistant] personal_repo` in the global `agents.toml`, or the `assistant` record of a SQL roster |
+| Shared repositories | none | `[assistant.shared.<group>]`, `[assistant.org]` (`write = false`) |
+| Run on an elevated Station | no | `[assistant] allow_elevated` |
+| Run beside Missions on the Station's own host | no | `[assistant] allow_beside_local_missions` |
+| Interpreters her scripts may run | `python3`, in the harness's sandbox | `[assistant] interpreters` |
+| Hosts her web tools and scripts reach | none (`limited` with no host) | `[assistant] network`, `allowed_hosts` |
+| Scripts where the harness has no sandbox | none | `[assistant] unsandboxed_scripts` |
+| Skills | none | `[assistant.skills.<name>]` (`path`, `pin`) |
+| Narrower scripts, network and skills for a group or a person | none | `[assistant.group.<group>]`, `[assistant.person.<id>]` |
+| Load a skill without a pin | no | `[assistant] skills_unpinned` |
+| Load a skill that grants tools, registers hooks or runs commands | no | `[assistant] skills_allow_tools` |

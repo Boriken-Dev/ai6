@@ -1,0 +1,109 @@
+name: Docs
+
+# The only workflow that deploys Pages, so the site can be rebuilt without cutting a
+# release: on a push to main that touches a docs source, and on demand for any ref.
+# A release made with the workflow's own GITHUB_TOKEN starts no workflow, so a release
+# workflow dispatches this one at its tag rather than this one listening for releases.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - "CHANGELOG.md"
+      - "crates/**/*.rs"
+      - "crates/providers/**/*.rs"
+      - "clients/**"
+      - "tools/sdk/docs-requirements.txt"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build"
+        required: false
+        default: ""
+  workflow_call:
+    inputs:
+      deploy:
+        description: "Deploy the built site, or only prove it builds"
+        type: boolean
+        required: false
+        default: true
+      ref:
+        description: "Git ref to build"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-deploy
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build the documentation site
+    runs-on: ubuntu-latest
+    # Builds only: nothing in this job can write Pages.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.14.7"
+      - name: Build the Rust API reference
+        # Strict, so a broken intra-doc link fails here rather than shipping.
+        run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Install the narrative docs tooling
+        run: pip install --require-hashes -r tools/sdk/docs-requirements.txt
+      - name: Build the narrative site
+        run: mkdocs build --strict
+        env:
+          # Material's upstream MkDocs 2.0 banner is not a site diagnostic; keep
+          # strict mode focused on broken links and actual build warnings.
+          NO_MKDOCS_2_WARNING: "1"
+      - name: Add the Rust reference under /rust/
+        # Cargo doc writes no root index for a workspace; provide one.
+        run: |
+          mkdir -p site/rust
+          cp -r target/doc/. site/rust/
+          printf '%s' '<!doctype html><meta charset="utf-8"><title>AI6 Rust API</title><h1>AI6 Rust API</h1><ul><li><a href="ai6/index.html">ai6: the Station daemon and AI6 contracts</a></li><li><a href="universal_exports/index.html">universal-exports: the public API gateway</a></li><li><a href="ai6_diptel/index.html">ai6-diptel: the wire contract</a></li><li><a href="ai6_agent_claude/index.html">ai6-agent-claude: Claude Code AgentHandler</a></li><li><a href="ai6_agent_codex/index.html">ai6-agent-codex: Codex AgentHandler</a></li><li><a href="ai6_terminal_pty/index.html">ai6-terminal-pty: the pty terminal provider</a></li><li><a href="ai6_terminal_pipe/index.html">ai6-terminal-pipe: the pipe terminal provider</a></li><li><a href="ai6_transport_local/index.html">ai6-transport-local: the local transport provider</a></li><li><a href="ai6_transport_ssh/index.html">ai6-transport-ssh: the ssh transport provider</a></li><li><a href="ai6_transport_adb/index.html">ai6-transport-adb: the adb transport provider</a></li><li><a href="ai6_transport_container/index.html">ai6-transport-container: the container transport provider</a></li><li><a href="ai6_transport_qemu/index.html">ai6-transport-qemu: the qemu transport provider</a></li><li><a href="ai6_theater_container/index.html">ai6-theater-container: the ephemeral container Theater provider</a></li><li><a href="ai6_safehouse_git/index.html">ai6-safehouse-git: the git safe-house provider</a></li><li><a href="ai6_safehouse_copy/index.html">ai6-safehouse-copy: the copy safe-house provider</a></li><li><a href="ai6_source_github/index.html">ai6-source-github</a></li><li><a href="ai6_source_gitlab/index.html">ai6-source-gitlab</a></li><li><a href="ai6_source_jira/index.html">ai6-source-jira</a></li></ul><p>Shared crates: <a href="https://boriken-dev.github.io/coqui-access/">coqui-access</a> (access kinds, role authorizer and the access providers) and <a href="https://boriken-dev.github.io/coqui-peer-tls/">coqui-peer-tls</a> (Station mutual TLS).</p>' > site/rust/index.html
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
+        with:
+          path: site/
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    # Absent outside a call, so a push or a dispatch deploys; a caller passing
+    # `deploy: false` only proves the site builds. Compared as text: Actions' `!=`
+    # coerces an absent input and `false` to the same 0.
+    if: ${{ format('{0}', inputs.deploy) != 'false' }}
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      # Turns Pages on by itself, so a fresh clone or fork does not depend on a setting
+      # somebody clicked; it needs `pages: write`, which only this job holds.
+      - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
+        with:
+          enablement: true
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5

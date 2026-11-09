@@ -1,0 +1,176 @@
+//! Station check-ins and settings, and the Headquarters lease.
+
+use std::collections::BTreeMap;
+use std::io;
+use std::time::Duration;
+
+use super::db::Tx;
+use super::{SqlRegistry, row_limit};
+use crate::directorates::m::placement::ResourceLimits;
+use crate::directorates::registry::store::{
+    HeadquartersLease, StationRecord, StationRecordFile, StationSettings, StationStore,
+    check_election, check_in_record, check_settings, elected, invalid_data, validate_station_id,
+};
+
+/// The Headquarters lease, read in the transaction that may replace it.
+pub(super) fn headquarters_in(tx: &mut Tx<'_>) -> io::Result<Option<HeadquartersLease>> {
+    let Some(row) = tx.query_opt(
+        "SELECT station, expires, term FROM ai6_headquarters WHERE id = 1",
+        &[],
+    )?
+    else {
+        return Ok(None);
+    };
+    let station = row.text(0)?;
+    let expires = row.real(1)?;
+    validate_station_id(&station)?;
+    if !expires.is_finite() {
+        return Err(invalid_data("invalid Headquarters lease expiry"));
+    }
+    Ok(Some(HeadquartersLease {
+        station,
+        expires,
+        term: u64::try_from(row.int(2)?).map_err(|_| invalid_data("invalid Headquarters term"))?,
+    }))
+}
+
+impl StationStore for SqlRegistry {
+    fn check_in(&self, station: &str, info: BTreeMap<String, serde_json::Value>) -> io::Result<()> {
+        validate_station_id(station)?;
+        self.write(|tx, revision| {
+            let record = String::from_utf8(check_in_record(
+                station,
+                info,
+                tx.now()?,
+                &self.limits.stations,
+            )?)
+            .map_err(|_| invalid_data("station record is not UTF-8"))?;
+            tx.execute(
+                "INSERT INTO ai6_stations (station, record, revision) VALUES ($1, $2, $3) \
+                 ON CONFLICT (station) DO UPDATE SET record = excluded.record, \
+                 revision = excluded.revision",
+                &[station.into(), record.into(), revision.into()],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn stations(&self, within: Duration) -> io::Result<Vec<StationRecord>> {
+        let (rows, now) = self.read(|tx| {
+            let rows = tx.query(
+                "SELECT record FROM ai6_stations ORDER BY station LIMIT $1",
+                &[row_limit(self.limits.stations.records)
+                    .saturating_add(1)
+                    .into()],
+            )?;
+            Ok::<_, io::Error>((rows, tx.now()?))
+        })?;
+        if !self.limits.stations.records.allows(rows.len()) {
+            return Err(invalid_data(format!(
+                "Registry has more than {} station records",
+                self.limits.stations.records
+            )));
+        }
+        let window = within.as_secs_f64();
+        let mut stations = Vec::with_capacity(rows.len());
+        for row in rows {
+            let text = row.text(0)?;
+            if !self.limits.stations.record_bytes.allows(text.len()) {
+                continue;
+            }
+            let Ok(file) = serde_json::from_str::<StationRecordFile>(&text) else {
+                continue;
+            };
+            let Ok(record) = file.into_station_record() else {
+                continue;
+            };
+            if now - record.seen() <= window {
+                stations.push(record);
+            }
+        }
+        Ok(stations)
+    }
+
+    fn station_settings(&self, station: &str) -> io::Result<Option<StationSettings>> {
+        validate_station_id(station)?;
+        let row = self.read(|tx| {
+            tx.query_opt(
+                "SELECT max_concurrent_missions, min_free_memory_mb, max_cpu_percent \
+                 FROM ai6_station_settings WHERE station = $1",
+                &[station.into()],
+            )
+        })?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let memory = u64::try_from(row.int(1)?).ok();
+        let cpu = u32::try_from(row.int(2)?).ok();
+        usize::try_from(row.int(0)?)
+            .ok()
+            .zip(memory.zip(cpu))
+            .and_then(|(capacity, (memory, cpu))| {
+                StationSettings::try_new(station, capacity)
+                    .and_then(|settings| {
+                        settings.with_resource_limits(ResourceLimits::new(memory, cpu))
+                    })
+                    .ok()
+            })
+            .map(Some)
+            .ok_or_else(|| invalid_data("Station settings are invalid"))
+    }
+
+    fn set_station_settings(&self, station: &str, settings: &StationSettings) -> io::Result<()> {
+        check_settings(station, settings, &self.limits.stations)?;
+        let limits = settings.resource_limits();
+        self.write(|tx, revision| {
+            tx.execute(
+                "INSERT INTO ai6_station_settings \
+                 (station, max_concurrent_missions, min_free_memory_mb, max_cpu_percent, revision) \
+                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT (station) DO UPDATE SET \
+                 max_concurrent_missions = excluded.max_concurrent_missions, \
+                 min_free_memory_mb = excluded.min_free_memory_mb, \
+                 max_cpu_percent = excluded.max_cpu_percent, \
+                 revision = excluded.revision",
+                &[
+                    station.into(),
+                    settings.max_concurrent_missions().into(),
+                    i64::try_from(limits.min_free_memory_mb)
+                        .map_err(|_| invalid_data("minimum free memory is too large"))?
+                        .into(),
+                    limits.max_cpu_percent.into(),
+                    revision.into(),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn elect(&self, station: &str, ttl: Duration) -> io::Result<bool> {
+        check_election(station, ttl)?;
+        self.write(|tx, revision| {
+            let current = headquarters_in(tx)?;
+            let Some(lease) = elected(current.as_ref(), station, ttl, tx.now()?) else {
+                return Ok(false);
+            };
+            tx.execute(
+                "INSERT INTO ai6_headquarters (id, station, expires, term, revision) \
+                 VALUES (1, $1, $2, $3, $4) ON CONFLICT (id) DO UPDATE SET \
+                 station = excluded.station, expires = excluded.expires, term = excluded.term, \
+                 revision = excluded.revision",
+                &[
+                    lease.station().into(),
+                    lease.expires().into(),
+                    i64::try_from(lease.term())
+                        .map_err(|_| invalid_data("Headquarters term overflow"))?
+                        .into(),
+                    revision.into(),
+                ],
+            )?;
+            Ok(true)
+        })
+    }
+
+    fn headquarters(&self) -> io::Result<Option<HeadquartersLease>> {
+        self.read(headquarters_in)
+    }
+}
